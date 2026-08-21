@@ -2,8 +2,9 @@ name: Release
 
 on:
   push:
-    # Every merge to main cuts a release. Other branches build and package the
-    # artifacts without publishing, so the pipeline can be exercised safely.
+    # Every merge to main cuts a release. Other branches run the same build,
+    # packaging and image build without publishing anything, so the pipeline
+    # can be exercised safely.
     branches: [main, "claude/**"]
   workflow_dispatch:
     inputs:
@@ -15,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release
@@ -30,6 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
+      ref: ${{ steps.plan.outputs.ref }}
       publish: ${{ steps.plan.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +58,13 @@ jobs:
             echo "tag=v$version"
             echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
+          # Everything downstream builds this exact commit, so the binaries,
+          # the archives and the image are all the same code.
+          if [[ "$publish" == "true" ]]; then
+            echo "ref=v$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
           echo "::notice::${bump} bump -> ${version} (publish: ${publish})"
 
       - name: Bump, commit and tag
@@ -66,16 +76,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
-          # Rewrites the packrat entry in Cargo.lock so --locked builds work.
-          cargo metadata --format-version 1 > /dev/null
-          locked="$(grep -A1 'name = "packrat"' Cargo.lock | grep '^version' | cut -d'"' -f2)"
-          [[ "$locked" == "$VERSION" ]] || {
-            echo "Cargo.lock still says $locked, expected $VERSION" >&2
-            exit 1
-          }
-
+          scripts/stamp-version.sh "$VERSION"
           git add Cargo.toml Cargo.lock
           git commit -m "Release $VERSION [skip ci]"
           git tag -a "$TAG" -m "Packrat $VERSION"
@@ -96,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.tag || github.sha }}
+          ref: ${{ needs.prepare.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -111,22 +112,9 @@ jobs:
         # architecture regardless of its glibc.
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Stamp the version into the manifest
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        # On a real release the tag already carries the bumped version, so this
-        # is a no-op. On a branch build nothing has bumped anything, and without
-        # this the archive would be named for one version while the binary
-        # inside reported another.
-        run: |
-          set -euo pipefail
-          current="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          if [[ "$current" != "$VERSION" ]]; then
-            sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
-            # Keeps Cargo.lock in step so the build below can stay --locked.
-            cargo metadata --format-version 1 > /dev/null
-          fi
-          grep -m1 '^version = ' Cargo.toml
+      - name: Stamp the version
+        # No-op on a real release, where the tag already carries the bump.
+        run: scripts/stamp-version.sh "${{ needs.prepare.outputs.version }}"
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -155,8 +143,8 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          # The archive name, the git tag and what the binary says about itself
-          # all have to agree, so assert it rather than hope.
+          # The archive name, the git tag, the image tag and what the binary
+          # says about itself all have to agree, so assert it rather than hope.
           reported="$(./target/${{ matrix.target }}/release/packrat --version | head -1)"
           echo "$reported"
           if [[ "$reported" != "packrat $VERSION" ]]; then
@@ -229,7 +217,7 @@ jobs:
             echo '```'
             echo
             echo 'The binaries are statically linked, so they run on any Linux of that'
-            echo 'architecture. A container image for the same version is at'
+            echo 'architecture. The container image for this exact version is'
             echo "\`ghcr.io/t342guy/packrat:${VERSION}\`."
             echo
             echo "## Checksums"
@@ -253,3 +241,86 @@ jobs:
             artifacts/*.tar.gz artifacts/*.zip
           echo "### Released [$VERSION]($(gh release view "$TAG" --json url --jq .url))" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    name: Container image
+    # Last, so a published image always corresponds to a release that exists.
+    # `always()` lets this run on branch builds, where publish is skipped
+    # rather than successful — there it validates the Dockerfile without
+    # pushing anything.
+    needs: [prepare, build, publish]
+    if: |
+      always()
+      && needs.prepare.result == 'success'
+      && needs.build.result == 'success'
+      && needs.publish.result != 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+
+      - name: Work out the image name
+        # GHCR requires a lowercase image path; the repository name may not be.
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Stamp the version
+        # So the binary inside the image reports the same version as the
+        # release it was cut from, on branch builds as well as releases.
+        run: scripts/stamp-version.sh "${{ needs.prepare.outputs.version }}"
+
+      - name: Work out the image tags
+        # `latest` should only ever mean "the current main", so a manual run
+        # from a branch tags the version and nothing else.
+        run: |
+          set -euo pipefail
+          tags="${IMAGE}:${{ needs.prepare.outputs.version }}"
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            tags="${tags}"$'\n'"${IMAGE}:latest"
+          fi
+          {
+            echo "TAGS<<TAGS_EOF"
+            echo "$tags"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: needs.prepare.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # x86-64 only, and deliberately. Adding linux/arm64 here means
+          # building it under QEMU, which took this job from three minutes to
+          # twenty-five — a poor trade for a platform almost nobody runs this
+          # on. Release archives still carry an arm64 binary, because those
+          # build natively and cost nothing.
+          platforms: linux/amd64
+          push: ${{ needs.prepare.outputs.publish == 'true' }}
+          tags: ${{ env.TAGS }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            if [[ "${{ needs.prepare.outputs.publish }}" == "true" ]]; then
+              echo "### Image pushed"
+              echo
+              echo '```'
+              echo "${IMAGE}:${{ needs.prepare.outputs.version }}"
+              echo "${IMAGE}:latest"
+              echo '```'
+            else
+              echo "### Image built, not pushed (branch build)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

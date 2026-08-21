@@ -341,18 +341,30 @@ it, and the benchmarks. Benchmark medians are published to the job summary as
 a table; they do not gate the build, because runner timings are too noisy to
 fail on, but a regression is visible while the change is still in progress.
 
-**Container images** go to `ghcr.io/t342guy/packrat` from `main` and from `v*`
-tags, built for x86-64. Release archives additionally carry an arm64 binary for
-anyone running this on a Pi; the image is x86-64 only because building arm64
-images means emulation, which cost twenty-five minutes a push against three.
-
-**Releases** are cut automatically on every merge to `main`, or on demand from
+**Releases** are one pipeline, run on every merge to `main` or on demand from
 the Actions tab where you can choose whether to raise the patch, minor or major
-part. The workflow bumps the version in `Cargo.toml`, commits it back, tags it,
-builds statically linked binaries for x86-64 and arm64 Linux, packages each as
-both `.tar.gz` and `.zip` with the README and the installer alongside, and
-publishes a GitHub release listing every commit since the previous tag, with
-SHA-256 checksums.
+part. In order, it:
+
+1. works out the next version and bumps `Cargo.toml`, commits it back and tags it;
+2. builds statically linked binaries for x86-64 and arm64 Linux from that tag,
+   packaging each as both `.tar.gz` and `.zip` with the README, the licence and
+   the installer alongside;
+3. publishes a GitHub release listing every commit since the previous tag, with
+   SHA-256 checksums;
+4. builds the container image from the same commit and pushes it to
+   `ghcr.io/t342guy/packrat`, tagged with that version, plus `latest` from
+   `main`.
+
+Keeping the image in the same run is the point: when it was a separate
+workflow, it built whatever `Cargo.toml` said at its own ref, so an image from
+`main` carried the version from *before* the bump. Now the release archives,
+the git tag and the image all name the same version, and the build asserts that
+the binary agrees before anything is published.
+
+The image is x86-64 only because building arm64 images means emulation, which
+cost twenty-five minutes a push against three. Release archives still carry an
+arm64 binary for anyone running this on a Pi, since those build natively and
+cost nothing.
 
 Versions look like `0.1.1-2026.aug.21` — the semver part says what changed, the
 date says when it was built. The day is deliberately not zero-padded: semver
