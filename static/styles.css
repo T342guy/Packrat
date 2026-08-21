@@ -35,6 +35,10 @@
 
 * { box-sizing: border-box; }
 
+/* Buttons and links set `display`, which would otherwise beat the UA rule for
+   the `hidden` attribute. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -280,3 +284,88 @@ code.inline {
   border-bottom: 1px solid var(--border); font-size: 14px;
 }
 .checklist label:hover { background: var(--surface-2); }
+
+/* ------------------------------------------------- check-ups & verifying */
+
+.badge {
+  display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 7px;
+  border-radius: 999px; background: var(--surface-2); color: var(--muted);
+  vertical-align: middle;
+}
+.badge.warn { background: #fdecc8; color: #8a5300; }
+@media (prefers-color-scheme: dark) {
+  .badge.warn { background: #4a3410; color: #f0b95c; }
+}
+
+.notice {
+  display: block; padding: 13px 15px; margin-bottom: 18px; color: var(--text);
+  border-left: 4px solid var(--accent);
+}
+.notice:hover { background: var(--surface-2); text-decoration: none; }
+.notice strong { display: block; margin-bottom: 2px; }
+.notice span { font-size: 14px; color: var(--muted); }
+
+.checkline-status {
+  margin-top: 8px; font-size: 13px; color: var(--muted);
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+}
+.checkline-status.stale { color: #8a5300; font-weight: 600; }
+@media (prefers-color-scheme: dark) { .checkline-status.stale { color: #f0b95c; } }
+.where.stale { color: #8a5300; }
+@media (prefers-color-scheme: dark) { .where.stale { color: #f0b95c; } }
+
+.progress {
+  height: 8px; border-radius: 999px; background: var(--surface-2);
+  overflow: hidden; margin: 6px 0 8px;
+}
+.progress .bar { height: 100%; background: var(--accent); transition: width .2s; }
+
+.verify-list .row.confirmed { background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.verify-list .where { white-space: normal; }
+/* The verify row carries five controls; below tablet width they get their own
+   line rather than squeezing the item's name to nothing. */
+@media (max-width: 620px) {
+  .verify-list .row { flex-wrap: wrap; }
+  .verify-list .body { flex: 1 1 100%; }
+  .verify-list .side { width: 100%; justify-content: flex-end; }
+}
+.verify-list .row.confirmed .name { text-decoration: line-through; text-decoration-thickness: 1px; }
+.verify-bar {
+  position: sticky; bottom: 0; margin-top: 16px; padding: 12px 0;
+  display: flex; gap: 8px; justify-content: space-between; flex-wrap: wrap;
+  background: linear-gradient(to top, var(--bg) 70%, transparent);
+}
+.verify-bar button { flex: 1 1 auto; justify-content: center; }
+button.tiny.danger { color: var(--danger); }
+
+/* --------------------------------------------- boxes nested in a shelf */
+
+details.childbox { margin-bottom: 10px; }
+details.childbox > summary {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 12px 14px; cursor: pointer; list-style: none; user-select: none;
+}
+details.childbox > summary::-webkit-details-marker { display: none; }
+details.childbox > summary::before {
+  content: '▸'; color: var(--muted); font-size: 12px; transition: transform .15s;
+}
+details.childbox[open] > summary::before { transform: rotate(90deg); }
+details.childbox > summary:hover { background: var(--surface-2); border-radius: var(--radius); }
+.child-name { font-weight: 700; }
+.child-count { color: var(--muted); font-size: 13px; margin-left: auto; }
+details.childbox > .list { border-top: 1px solid var(--border); }
+.childbox-actions {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  padding: 10px 14px; border-top: 1px solid var(--border);
+}
+.child-checked { font-size: 12px; color: var(--muted); margin-left: auto; }
+
+/* ------------------------------------------------------------ tag admin */
+
+.taglist { display: flex; flex-direction: column; }
+.tagrow {
+  display: flex; align-items: center; gap: 8px; padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.tagrow:last-child { border-bottom: 0; }
+.tagrow .spacer { flex: 1 1 auto; }

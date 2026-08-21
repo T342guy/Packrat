@@ -12,6 +12,14 @@ pub struct Container {
     pub photo_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+    /// When someone last confirmed the contents are still what's listed.
+    pub checked_at: Option<String>,
+    /// Days since that check; `None` when it has never been checked.
+    pub days_since_check: Option<i64>,
+    /// Days since the check, or since it was created if never checked.
+    pub age_days: i64,
+    /// Holds items and hasn't been verified within the staleness window.
+    pub stale: bool,
     /// "Garage / North shelves / Camping bin" — computed, not stored.
     pub path: String,
     pub depth: i64,
@@ -93,6 +101,7 @@ pub struct TagCount {
 
 #[derive(Debug, Serialize)]
 pub struct Stats {
+    pub stale_containers: i64,
     pub items: i64,
     pub total_quantity: i64,
     pub containers: i64,
@@ -104,12 +113,23 @@ pub struct Stats {
     pub database_bytes: i64,
 }
 
+/// A child container together with what's in it, so a shelf can list its boxes
+/// with their contents collapsed underneath each one.
+#[derive(Debug, Serialize)]
+pub struct ChildNode {
+    #[serde(flatten)]
+    pub container: Container,
+    pub items: Vec<Item>,
+    /// Containers nested one level further down (boxes inside a bin).
+    pub child_count: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ContainerDetail {
     pub container: Container,
     /// Ancestors, outermost first — used for breadcrumbs.
     pub ancestors: Vec<Container>,
-    pub children: Vec<Container>,
+    pub children: Vec<ChildNode>,
     pub items: Vec<Item>,
     /// Everything inside this container *and* its descendants.
     pub nested_item_count: i64,

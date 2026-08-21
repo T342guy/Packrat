@@ -134,6 +134,138 @@ pub async fn container_qr(
 
 // ------------------------------------------------------------------- labels
 
+/// A physical label size. Roll formats (`page_mm`) print one label per page,
+/// which is how a DYMO LabelWriter expects to be driven from a browser; sheet
+/// formats tile labels onto ordinary A4/Letter paper.
+pub struct LabelFormat {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Page size in millimetres for roll/label-printer stock.
+    pub page_mm: Option<(f32, f32)>,
+    pub columns: usize,
+    pub qr_mm: f32,
+    pub show_name: bool,
+    pub show_location: bool,
+    pub show_contents: bool,
+    pub max_items: usize,
+    /// Square labels stack the QR above the code instead of beside it.
+    pub stacked: bool,
+}
+
+/// Sizes are the printable label dimensions in millimetres, long edge first
+/// for the roll formats — that is the orientation a LabelWriter prints in.
+pub const LABEL_FORMATS: &[LabelFormat] = &[
+    LabelFormat {
+        id: "sheet-large",
+        name: "A4/Letter sheet — with contents",
+        page_mm: None,
+        columns: 2,
+        qr_mm: 31.0,
+        show_name: true,
+        show_location: true,
+        show_contents: true,
+        max_items: 14,
+        stacked: false,
+    },
+    LabelFormat {
+        id: "sheet-small",
+        name: "A4/Letter sheet — compact",
+        page_mm: None,
+        columns: 3,
+        qr_mm: 23.0,
+        show_name: true,
+        show_location: true,
+        show_contents: false,
+        max_items: 0,
+        stacked: false,
+    },
+    LabelFormat {
+        id: "dymo-30332",
+        name: "DYMO 30332 — 1\" × 1\" square",
+        page_mm: Some((25.4, 25.4)),
+        columns: 1,
+        qr_mm: 16.0,
+        show_name: true,
+        show_location: false,
+        show_contents: false,
+        max_items: 0,
+        stacked: true,
+    },
+    LabelFormat {
+        id: "dymo-30336",
+        name: "DYMO 30336 — 1\" × 2⅛\" multipurpose",
+        page_mm: Some((54.0, 25.4)),
+        columns: 1,
+        qr_mm: 21.0,
+        show_name: true,
+        show_location: false,
+        show_contents: false,
+        max_items: 0,
+        stacked: false,
+    },
+    LabelFormat {
+        id: "dymo-30334",
+        name: "DYMO 30334 — 2¼\" × 1¼\" multipurpose",
+        page_mm: Some((57.15, 31.75)),
+        columns: 1,
+        qr_mm: 26.0,
+        show_name: true,
+        show_location: true,
+        show_contents: true,
+        max_items: 4,
+        stacked: false,
+    },
+    LabelFormat {
+        id: "dymo-30252",
+        name: "DYMO 30252 — 1⅛\" × 3½\" address",
+        page_mm: Some((88.9, 28.6)),
+        columns: 1,
+        qr_mm: 24.0,
+        show_name: true,
+        show_location: true,
+        show_contents: true,
+        max_items: 5,
+        stacked: false,
+    },
+    LabelFormat {
+        id: "dymo-30323",
+        name: "DYMO 30323 — 2⅛\" × 4\" shipping",
+        page_mm: Some((101.6, 54.0)),
+        columns: 1,
+        qr_mm: 44.0,
+        show_name: true,
+        show_location: true,
+        show_contents: true,
+        max_items: 12,
+        stacked: false,
+    },
+];
+
+fn find_format(id: &str) -> Option<&'static LabelFormat> {
+    LABEL_FORMATS.iter().find(|f| f.id == id)
+}
+
+/// Builds a format for arbitrary label stock given its size in millimetres,
+/// so label printers other than the presets above still work.
+fn custom_format(width: f32, height: f32) -> LabelFormat {
+    let width = width.clamp(15.0, 300.0);
+    let height = height.clamp(15.0, 300.0);
+    let short = width.min(height);
+    let area = width * height;
+    LabelFormat {
+        id: "custom",
+        name: "Custom size",
+        page_mm: Some((width, height)),
+        columns: 1,
+        qr_mm: (short * 0.62).clamp(12.0, 60.0),
+        show_name: short >= 20.0,
+        show_location: area >= 1600.0,
+        show_contents: area >= 2200.0,
+        max_items: if area >= 4000.0 { 10 } else { 4 },
+        stacked: width < height * 1.35 && width > height * 0.75,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LabelParams {
     /// Comma-separated label codes, e.g. `BX-7K3Q,BN-2M9F`.
@@ -141,8 +273,13 @@ pub struct LabelParams {
     /// Print labels for every container.
     #[serde(default)]
     pub all: bool,
-    /// `large` (with contents list) or `small` (grid of QR + name).
+    /// Label stock: one of `LABEL_FORMATS`, or `custom` with `w`/`h`.
+    pub format: Option<String>,
+    /// Legacy alias kept working: `large` / `small` sheet layouts.
     pub size: Option<String>,
+    /// Custom label width/height in millimetres.
+    pub w: Option<f32>,
+    pub h: Option<f32>,
 }
 
 pub fn escape_html(s: &str) -> String {
@@ -160,41 +297,71 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
-/// Renders a printable sheet of labels. Each label carries a QR code that
-/// opens that container's page, plus a preview of what's inside so the label
-/// is still useful to someone without a phone.
+/// The label stock the print page knows how to lay out.
+pub async fn label_formats() -> Json<serde_json::Value> {
+    Json(json!(LABEL_FORMATS
+        .iter()
+        .map(|f| json!({
+            "id": f.id,
+            "name": f.name,
+            "page_mm": f.page_mm.map(|(w, h)| json!([w, h])),
+            "roll": f.page_mm.is_some(),
+            "shows_contents": f.show_contents,
+        }))
+        .collect::<Vec<_>>()))
+}
+
+/// Renders a printable sheet or roll of labels. Each label carries a QR code
+/// that opens that container's page, plus — where the label is big enough — a
+/// preview of what's inside, so it stays useful to someone without a phone.
 pub async fn print_labels(
     State(st): State<AppState>,
     Query(params): Query<LabelParams>,
 ) -> AppResult<Html<String>> {
     let base = st.public_url();
-    let large = params.size.as_deref() != Some("small");
+    let requested = params.format.clone().unwrap_or_else(|| match params.size.as_deref() {
+        Some("small") => "sheet-small".to_string(),
+        _ => "sheet-large".to_string(),
+    });
+    let custom;
+    let format = match find_format(&requested) {
+        Some(f) => f,
+        None if requested == "custom" => {
+            custom = custom_format(params.w.unwrap_or(25.4), params.h.unwrap_or(25.4));
+            &custom
+        }
+        None => find_format("sheet-large").unwrap(),
+    };
 
-    let wanted: Option<Vec<String>> = params.codes.as_ref().map(|c| {
+    let wanted: Option<Vec<String>> = params.codes.as_ref().filter(|_| !params.all).map(|c| {
         c.split(',').map(store::normalize_code).filter(|s| !s.is_empty()).collect()
     });
 
+    let max_items = format.max_items;
     let containers = db::run(&st.pool, {
         let wanted = wanted.clone();
         move |c| {
             let all = store::all_containers(c)?;
             let selected: Vec<_> = match &wanted {
-                Some(codes) if !codes.is_empty() => all
-                    .into_iter()
-                    .filter(|x| codes.contains(&x.code.to_uppercase()))
-                    .collect(),
+                Some(codes) if !codes.is_empty() => {
+                    all.into_iter().filter(|x| codes.contains(&x.code.to_uppercase())).collect()
+                }
                 _ => all,
             };
             let mut out = Vec::new();
             for container in selected {
-                let items = store::query_items(
-                    c,
-                    &store::ItemQuery {
-                        container_id: Some(container.id),
-                        limit: Some(14),
-                        ..Default::default()
-                    },
-                )?;
+                let items = if max_items > 0 {
+                    store::query_items(
+                        c,
+                        &store::ItemQuery {
+                            container_id: Some(container.id),
+                            limit: Some(max_items as i64),
+                            ..Default::default()
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
                 out.push((container, items));
             }
             Ok(out)
@@ -202,24 +369,27 @@ pub async fn print_labels(
     })
     .await?;
 
-    if containers.is_empty() && (params.all || wanted.is_some()) {
-        return Ok(Html(page_shell("No labels", "<p class=\"empty\">No containers matched. Add a box first, then print its label.</p>".into())));
+    if containers.is_empty() {
+        return Ok(Html(page_shell(
+            "No labels",
+            format,
+            "<p class=\"empty\">No containers matched. Add a box first, then print its label.</p>"
+                .into(),
+        )));
     }
 
     let mut body = String::new();
-    body.push_str(
-        r#"<div class="toolbar no-print">
-             <button onclick="window.print()">Print these labels</button>
-             <a href="/#/labels">Back to the app</a>
-             <span class="hint">Tip: print at 100% scale, then tape one label per box.</span>
-           </div>"#,
-    );
-    body.push_str(if large { "<div class=\"sheet large\">" } else { "<div class=\"sheet small\">" });
+    body.push_str(&toolbar(format));
+    body.push_str(&format!(
+        "<div class=\"sheet {}\">",
+        if format.page_mm.is_some() { "roll" } else { "paper" }
+    ));
 
     for (container, items) in &containers {
         let url = format!("{}/b/{}", base, container.code);
-        let qr = qr_svg(&url, if large { 260 } else { 180 })?;
-        let contents = if large && !items.is_empty() {
+        let qr = qr_svg(&url, (format.qr_mm * 8.0) as u32)?;
+
+        let contents = if format.show_contents && !items.is_empty() {
             let lis: String = items
                 .iter()
                 .map(|i| {
@@ -233,7 +403,7 @@ pub async fn print_labels(
                 .collect();
             let more = if container.item_count > items.len() as i64 {
                 format!(
-                    "<li class=\"more\">+ {} more — scan for the full list</li>",
+                    "<li class=\"more\">+{} more — scan for the full list</li>",
                     container.item_count - items.len() as i64
                 )
             } else {
@@ -243,35 +413,121 @@ pub async fn print_labels(
         } else {
             String::new()
         };
-        let location = if container.path.contains(" / ") {
-            let parent =
-                container.path.rsplit_once(" / ").map(|(head, _)| head.to_string()).unwrap_or_default();
+
+        let location = if format.show_location && container.path.contains(" / ") {
+            let parent = container
+                .path
+                .rsplit_once(" / ")
+                .map(|(head, _)| head.to_string())
+                .unwrap_or_default();
             format!("<div class=\"where\">{}</div>", escape_html(&parent))
         } else {
             String::new()
         };
+        let name = if format.show_name {
+            format!("<div class=\"name\">{}</div>", escape_html(&container.name))
+        } else {
+            String::new()
+        };
+
         body.push_str(&format!(
-            r#"<div class="label">
+            r#"<div class="label{stacked}">
                  <div class="qr">{qr}</div>
                  <div class="meta">
                    <div class="code">{code}</div>
-                   <div class="name">{name}</div>
+                   {name}
                    {location}
                    {contents}
                  </div>
                </div>"#,
+            stacked = if format.stacked { " stacked" } else { "" },
             qr = qr,
             code = escape_html(&container.code),
-            name = escape_html(&container.name),
+            name = name,
             location = location,
             contents = contents,
         ));
     }
     body.push_str("</div>");
-    Ok(Html(page_shell("Labels", body)))
+    Ok(Html(page_shell("Labels", format, body)))
 }
 
-fn page_shell(title: &str, body: String) -> String {
+fn toolbar(format: &LabelFormat) -> String {
+    let options: String = LABEL_FORMATS
+        .iter()
+        .map(|f| {
+            format!(
+                "<option value=\"{}\"{}>{}</option>",
+                f.id,
+                if f.id == format.id { " selected" } else { "" },
+                escape_html(f.name)
+            )
+        })
+        .collect();
+    let roll_help = if let Some((w, h)) = format.page_mm {
+        format!(
+            "<p class=\"help\">Printing to a label printer: pick the LabelWriter in the print \
+             dialog, set the label size to <strong>{}</strong> ({w} × {h} mm), margins to none \
+             and scale to 100% — turn off “fit to page”. One label prints per page.</p>",
+            escape_html(format.name)
+        )
+    } else {
+        "<p class=\"help\">Print at 100% scale on ordinary paper, then tape or glue one label \
+         per box.</p>"
+            .to_string()
+    };
+    format!(
+        r#"<div class="toolbar no-print">
+             <button onclick="window.print()">Print</button>
+             <label class="pick">Label stock
+               <select id="format">{options}<option value="custom"{custom}>Custom size…</option></select>
+             </label>
+             <a href="/#/labels">Back to the app</a>
+           </div>
+           {roll_help}
+           <script>
+             document.getElementById('format').addEventListener('change', (e) => {{
+               const params = new URLSearchParams(location.search);
+               if (e.target.value === 'custom') {{
+                 const size = prompt('Label size in millimetres, width × height', '25 x 25');
+                 if (!size) return;
+                 const [w, h] = size.split(/[x×,]/).map((n) => parseFloat(n.trim()));
+                 if (!w || !h) return;
+                 params.set('w', w); params.set('h', h);
+               }}
+               params.set('format', e.target.value);
+               params.delete('size');
+               location.search = params.toString();
+             }});
+           </script>"#,
+        options = options,
+        custom = if format.id == "custom" { " selected" } else { "" },
+        roll_help = roll_help,
+    )
+}
+
+fn page_shell(title: &str, format: &LabelFormat, body: String) -> String {
+    // Roll stock prints one label per page at the exact label size; sheet
+    // stock tiles labels onto whatever paper the printer holds.
+    let (page_rule, label_rule, sheet_rule) = match format.page_mm {
+        Some((w, h)) => (
+            format!("@page {{ size: {w}mm {h}mm; margin: 0; }}"),
+            format!(
+                ".label {{ width: {w}mm; height: {h}mm; padding: 1.6mm; gap: 1.6mm;
+                          border-radius: 0; overflow: hidden; }}
+                 @media print {{ .label {{ break-after: page; page-break-after: always;
+                                          border: 0; }} }}"
+            ),
+            ".sheet.roll { grid-template-columns: max-content; justify-content: center; }"
+                .to_string(),
+        ),
+        None => (
+            "@page { margin: 10mm; }".to_string(),
+            ".label { padding: 12px; gap: 12px; }".to_string(),
+            format!(".sheet.paper {{ grid-template-columns: repeat({}, 1fr); }}", format.columns),
+        ),
+    };
+    let qr = format.qr_mm;
     format!(
         r#"<!doctype html>
 <html lang="en"><head>
@@ -282,34 +538,44 @@ fn page_shell(title: &str, body: String) -> String {
   * {{ box-sizing: border-box; }}
   body {{ font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
          margin: 0; padding: 16px; color: #111; background: #f6f7f9; }}
-  .toolbar {{ display: flex; gap: 14px; align-items: center; margin-bottom: 18px; flex-wrap: wrap; }}
+  .toolbar {{ display: flex; gap: 14px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }}
   .toolbar button {{ font: inherit; font-weight: 600; padding: 9px 16px; border-radius: 8px;
-                     border: 0; background: #2f6fed; color: #fff; cursor: pointer; }}
-  .toolbar a {{ color: #2f6fed; }}
-  .hint {{ color: #666; font-size: 13px; }}
+                     border: 0; background: #b45309; color: #fff; cursor: pointer; }}
+  .toolbar a {{ color: #1d4ed8; }}
+  .toolbar .pick {{ display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; }}
+  .toolbar select {{ font: inherit; font-size: 14px; padding: 6px 8px; border-radius: 8px;
+                     border: 1px solid #ccc; background: #fff; color: #111; }}
+  .help {{ color: #555; font-size: 13px; max-width: 70ch; margin: 0 0 18px; }}
   .empty {{ color: #666; }}
   .sheet {{ display: grid; gap: 10px; }}
-  .sheet.large {{ grid-template-columns: repeat(2, 1fr); }}
-  .sheet.small {{ grid-template-columns: repeat(3, 1fr); }}
-  .label {{ display: flex; gap: 12px; padding: 12px; border: 2px dashed #bbb; border-radius: 10px;
-            background: #fff; break-inside: avoid; page-break-inside: avoid; }}
+  {sheet_rule}
+  .label {{ display: flex; border: 1px dashed #bbb; border-radius: 8px; background: #fff;
+            break-inside: avoid; page-break-inside: avoid; align-items: flex-start; }}
+  .label.stacked {{ flex-direction: column; align-items: center; text-align: center; gap: .8mm; }}
+  {label_rule}
+  {page_rule}
   .label .qr {{ flex: 0 0 auto; }}
-  .label .qr svg {{ display: block; width: 118px; height: 118px; }}
-  .sheet.small .label .qr svg {{ width: 86px; height: 86px; }}
-  .meta {{ min-width: 0; }}
-  .code {{ font: 700 15px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .5px; }}
-  .name {{ font-weight: 700; font-size: 17px; margin-top: 2px; word-break: break-word; }}
-  .sheet.small .name {{ font-size: 14px; }}
-  .where {{ color: #666; font-size: 12px; margin-top: 2px; }}
-  .contents {{ margin: 8px 0 0; padding-left: 16px; font-size: 12px; color: #333; columns: 1; }}
-  .contents li {{ margin: 1px 0; }}
-  .contents .qty {{ color: #666; }}
-  .contents .more {{ color: #888; font-style: italic; list-style: none; margin-left: -16px; }}
+  .label .qr svg {{ display: block; width: {qr}mm; height: {qr}mm; }}
+  .meta {{ min-width: 0; overflow: hidden; }}
+  .label.stacked .meta {{ width: 100%; }}
+  .code {{ font: 700 9pt ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .4px;
+           white-space: nowrap; }}
+  .label.stacked .code {{ font-size: 7.5pt; }}
+  .name {{ font-weight: 700; font-size: 11pt; margin-top: .4mm; line-height: 1.15;
+           overflow-wrap: anywhere; }}
+  .label.stacked .name {{ font-size: 6.5pt; white-space: nowrap; overflow: hidden;
+                          text-overflow: ellipsis; }}
+  .where {{ color: #555; font-size: 7.5pt; margin-top: .4mm; white-space: nowrap;
+            overflow: hidden; text-overflow: ellipsis; }}
+  .contents {{ margin: 1.4mm 0 0; padding-left: 4mm; font-size: 7.5pt; color: #222;
+               line-height: 1.25; }}
+  .contents li {{ margin: .2mm 0; }}
+  .contents .qty {{ color: #555; }}
+  .contents .more {{ color: #777; font-style: italic; list-style: none; margin-left: -4mm; }}
   @media print {{
     body {{ background: #fff; padding: 0; }}
-    .no-print {{ display: none !important; }}
-    .label {{ border-color: #ccc; }}
-    @page {{ margin: 10mm; }}
+    .no-print, .help {{ display: none !important; }}
+    .sheet {{ gap: 0; }}
   }}
 </style>
 </head><body>{body}</body></html>"#

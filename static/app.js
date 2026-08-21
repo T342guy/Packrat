@@ -14,6 +14,28 @@ const esc = (s) =>
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
+function agoLabel(days) {
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 31) return `${days} days ago`;
+  const months = Math.round(days / 30.4);
+  if (months < 18) return `${months} month${months === 1 ? '' : 's'} ago`;
+  const years = (days / 365).toFixed(days % 365 < 60 ? 0 : 1);
+  return `${years} years ago`;
+}
+
+/** "Checked 3 months ago" / "Never checked — added a year ago". */
+function checkLabel(container) {
+  return container.checked_at
+    ? `Checked ${agoLabel(container.days_since_check)}`
+    : `Never checked — added ${agoLabel(container.age_days)}`;
+}
+
+function staleBadge(container) {
+  if (!container.stale) return '';
+  return `<span class="badge warn" title="${esc(checkLabel(container))}">Needs a check</span>`;
+}
+
 function toast(message, isError = false) {
   const el = $('#toast');
   el.textContent = message;
@@ -116,6 +138,37 @@ function boxCard(container) {
     </a>`;
 }
 
+/** A box sitting on a shelf: header always visible, contents folded away. */
+function childBox(child) {
+  const counts = [];
+  if (child.items.length) counts.push(plural(child.items.length, 'item', 'items'));
+  if (child.child_count) counts.push(`${child.child_count} more inside`);
+  const body = child.items.length
+    ? `<div class="list">${child.items.map((i) => itemRow(i, { hideLocation: true })).join('')}</div>`
+    : `<div class="empty" style="padding:14px">Nothing listed in here yet.
+         <button class="tiny" data-act="add-item" data-container="${child.id}">Add an item</button>
+       </div>`;
+  return `
+    <details class="card childbox">
+      <summary>
+        <span class="chip code">${esc(child.code)}</span>
+        <span class="child-name">${esc(child.name)}</span>
+        ${staleBadge(child)}
+        <span class="child-count">${counts.join(' · ') || 'Empty'}</span>
+      </summary>
+      ${body}
+      <div class="childbox-actions">
+        <a class="btn tiny" href="#/box/${encodeURIComponent(child.code)}">Open</a>
+        <button class="tiny" data-act="edit-box" data-id="${child.id}">Rename / edit</button>
+        <button class="tiny" data-act="add-item" data-container="${child.id}">+ Item</button>
+        ${child.items.length
+          ? `<a class="btn tiny" href="#/verify/${encodeURIComponent(child.code)}">Check contents</a>`
+          : ''}
+        <span class="child-checked">${esc(checkLabel(child))}</span>
+      </div>
+    </details>`;
+}
+
 function containerOptions(selectedId, excludeId) {
   const excluded = new Set();
   if (excludeId) {
@@ -179,6 +232,14 @@ async function viewHome() {
       <div class="card stat"><div class="n">${s.containers}</div><div class="l">boxes &amp; places</div></div>
       <div class="card stat"><div class="n">${s.unfiled_items}</div><div class="l">not filed yet</div></div>
     </div>
+
+    ${s.stale_containers
+      ? `<a class="card notice" href="#/review">
+           <strong>⚠ ${plural(s.stale_containers, 'container needs', 'containers need')} a check</strong>
+           <span>Their contents haven't been confirmed in a while — open the check-up list to
+             work through them.</span>
+         </a>`
+      : ''}
 
     <div class="actions">
       <button class="primary" data-act="add-item">+ Add item</button>
@@ -246,9 +307,13 @@ async function viewBox(key) {
             ${plural(c.item_count, 'item', 'items')}${nested}
           </p>
           ${c.notes ? `<div class="notes">${esc(c.notes)}</div>` : ''}
+          <div class="checkline-status ${c.stale ? 'stale' : ''}">
+            ${c.stale ? '⚠ ' : ''}${esc(checkLabel(c))}
+            ${c.item_count ? `<a href="#/verify/${encodeURIComponent(c.code)}">Check contents</a>` : ''}
+          </div>
           <div class="actions" style="margin-top:12px">
             <button class="primary" data-act="add-item" data-container="${c.id}">+ Add item here</button>
-            <button data-act="edit-box" data-id="${c.id}">Edit</button>
+            <button data-act="edit-box" data-id="${c.id}">Rename / edit</button>
             <a class="btn" href="/labels?codes=${encodeURIComponent(c.code)}" target="_blank"
                rel="noopener">Print label</a>
           </div>
@@ -262,13 +327,103 @@ async function viewBox(key) {
 
     ${detail.children.length
       ? `<h2>Inside this ${esc((KIND_LABEL[c.kind] || 'container').toLowerCase())}</h2>
-         <div class="grid">${detail.children.map(boxCard).join('')}</div>`
+         ${detail.children.map(childBox).join('')}`
       : ''}
 
     <h2>Contents</h2>
     ${itemList(detail.items, `This ${esc((KIND_LABEL[c.kind] || 'container').toLowerCase())} is empty.
        <div style="margin-top:10px"><button class="tiny primary" data-act="add-item"
          data-container="${c.id}">Add the first item</button></div>`, { hideLocation: true })}`;
+}
+
+/** The queue of containers whose contents haven't been confirmed in a while. */
+async function viewReview() {
+  const data = await api('/api/stale');
+  const months = Math.round(data.stale_after_days / 30.4);
+  view().innerHTML = `
+    <h1>Check-ups</h1>
+    <p class="sub">Boxes are flagged when nobody has confirmed their contents for
+       ${data.stale_after_days} days (about ${plural(months, 'month', 'months')}). Change that in
+       <a href="#/settings">Settings</a>.</p>
+    ${data.containers.length
+      ? `<div class="card list">${data.containers.map((c) => `
+          <div class="row">
+            <div class="body">
+              <div class="name">
+                <a href="#/box/${encodeURIComponent(c.code)}">${esc(c.name)}</a>
+                <span class="chip code">${esc(c.code)}</span>
+              </div>
+              <div class="where">${esc(c.path)}</div>
+              <div class="where stale">⚠ ${esc(checkLabel(c))} · ${plural(c.item_count, 'item', 'items')} listed</div>
+            </div>
+            <div class="side">
+              <a class="btn tiny primary" href="#/verify/${encodeURIComponent(c.code)}">Check</a>
+              <button class="tiny" data-act="mark-checked" data-id="${c.id}"
+                      title="Confirm without opening it">Still fine</button>
+            </div>
+          </div>`).join('')}</div>`
+      : `<div class="card"><div class="empty"><strong>Everything is up to date</strong>
+           No box has gone ${data.stale_after_days} days without a check.</div></div>`}`;
+}
+
+/** Focused mode for working through one box: tick things off, fix what moved,
+    then mark the whole box as checked. */
+let verified = new Set();
+
+async function viewVerify(key) {
+  const path = /^\d+$/.test(key)
+    ? `/api/containers/${key}`
+    : `/api/by-code/${encodeURIComponent(key)}`;
+  const detail = await api(path);
+  const c = detail.container;
+  if (viewVerify._for !== c.id) {
+    verified = new Set();
+    viewVerify._for = c.id;
+  }
+  const done = detail.items.filter((i) => verified.has(i.id)).length;
+  const total = detail.items.length;
+  const percent = total ? Math.round((done / total) * 100) : 100;
+
+  view().innerHTML = `
+    <div class="crumbs"><a href="#/review">Check-ups</a> /
+      <a href="#/box/${encodeURIComponent(c.code)}">${esc(c.name)}</a></div>
+    <h1>Checking ${esc(c.name)}</h1>
+    <p class="sub"><span class="chip code">${esc(c.code)}</span> ${esc(checkLabel(c))} ·
+       ${esc(c.path)}</p>
+    <div class="progress"><div class="bar" style="width:${percent}%"></div></div>
+    <p class="sub">${done} of ${total} confirmed. Tick what's actually in the box, fix anything
+       that's wrong, then mark it checked.</p>
+
+    ${total
+      ? `<div class="card list verify-list">
+           ${detail.items.map((i) => `
+             <div class="row ${verified.has(i.id) ? 'confirmed' : ''}">
+               ${i.photo_id ? `<img class="thumb" src="/photos/${i.photo_id}" alt="" loading="lazy">` : ''}
+               <div class="body">
+                 <div class="name">${esc(i.name)}</div>
+                 ${i.description ? `<div class="where">${esc(i.description)}</div>` : ''}
+                 <div class="where">Listed quantity: ${i.quantity}</div>
+               </div>
+               <div class="side">
+                 <button class="tiny ghost" data-act="qty" data-id="${i.id}" data-delta="-1">&minus;</button>
+                 <span class="qty" data-qty="${i.id}">${i.quantity}</span>
+                 <button class="tiny ghost" data-act="qty" data-id="${i.id}" data-delta="1">+</button>
+                 <button class="tiny ${verified.has(i.id) ? 'primary' : ''}"
+                         data-act="confirm-item" data-id="${i.id}">
+                   ${verified.has(i.id) ? '✓ Here' : 'Still here'}</button>
+                 <button class="tiny" data-act="edit-item" data-id="${i.id}">Edit</button>
+                 <button class="tiny danger" data-act="del-item" data-id="${i.id}"
+                         data-stay="1">Gone</button>
+               </div>
+             </div>`).join('')}
+         </div>`
+      : `<div class="card"><div class="empty">Nothing is listed in this box.</div></div>`}
+
+    <div class="verify-bar">
+      <button data-act="add-item" data-container="${c.id}">+ Found something new</button>
+      <button class="primary" data-act="mark-checked" data-id="${c.id}"
+              data-return="box">Mark as checked</button>
+    </div>`;
 }
 
 async function viewItems(params) {
@@ -322,9 +477,12 @@ async function viewBoxes() {
           <a href="#/box/${encodeURIComponent(c.code)}" style="flex:1 1 auto; min-width:0">
             <span class="chip code">${esc(c.code)}</span>
             <strong>${esc(c.name)}</strong>
+            ${staleBadge(c)}
           </a>
           <span class="kind">${esc(KIND_LABEL[c.kind] || '')}${
             counts.length ? ` · ${counts.join(' · ')}` : ''}</span>
+          <button class="tiny" data-act="edit-box" data-id="${c.id}"
+                  title="Rename or move ${esc(c.name)}">Rename</button>
         </div>`;
     })
     .join('');
@@ -343,6 +501,8 @@ async function viewBoxes() {
 }
 
 async function viewLabels() {
+  const formats = await api('/api/label-formats');
+  const saved = localStorage.getItem('label-format') || 'sheet-large';
   view().innerHTML = `
     <h1>Print labels</h1>
     <p class="sub">Each label carries a QR code. Scanning it on a phone connected to this
@@ -360,17 +520,25 @@ async function viewLabels() {
                </label>`).join('')}
            </div>
          </div>
+         <div class="card settings-block" style="padding:12px 14px">
+           <label class="field">Label stock
+             <select id="label-format">
+               ${formats.map((f) => `<option value="${f.id}"${f.id === saved ? ' selected' : ''}
+                 >${esc(f.name)}</option>`).join('')}
+               <option value="custom"${saved === 'custom' ? ' selected' : ''}>Custom size…</option>
+             </select>
+             <span class="hint">DYMO stock prints one label per page at its exact size —
+               pick the LabelWriter in the print dialog, margins none, scale 100%.</span>
+           </label>
+         </div>
          <div class="actions">
            <button data-act="label-all">Select all</button>
            <button data-act="label-none">Clear selection</button>
            <div style="flex:1 1 auto"></div>
-           <button data-act="print-labels" data-size="small">Print small labels</button>
-           <button class="primary" data-act="print-labels" data-size="large">
-             Print labels with contents
-           </button>
+           <button class="primary" data-act="print-labels">Open printable labels</button>
          </div>
-         <p class="sub" style="margin-top:12px">Large labels list what's inside, so the label
-            stays useful even without a phone. QR codes point at
+         <p class="sub" style="margin-top:12px">Bigger labels list what's inside, so they stay
+            useful even without a phone. QR codes point at
             <code class="inline">${esc(state.publicUrl)}</code> —
             change that in <a href="#/settings">Settings</a> if it's wrong.</p>`}`;
 }
@@ -399,6 +567,38 @@ async function viewSettings() {
       </form>
       <p style="margin-top:10px">Labels currently point at
          <code class="inline">${esc(settings.effective_public_url)}</code></p>
+    </div>
+
+    <div class="card settings-block">
+      <h3>Re-check reminders</h3>
+      <p>How long a box's contents are trusted before it shows up under
+         <a href="#/review">Check-ups</a>. Only boxes that actually hold items are flagged.</p>
+      <form data-form="settings">
+        <label class="field">Flag a box after
+          <input name="stale_after_days" type="number" min="1" max="3650" step="1"
+                 value="${settings.stale_after_days}">
+          <span class="hint">days without a check. 180 days is a good default for seasonal
+            storage; 365 for things you rarely touch.</span>
+        </label>
+        <div class="modal-actions" style="justify-content:flex-start;margin-top:10px">
+          <button class="primary" type="submit">Save</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card settings-block">
+      <h3>Tags</h3>
+      <p>Renaming a tag updates every item using it. Renaming onto an existing tag merges them.</p>
+      ${state.tags.length
+        ? `<div class="taglist">${state.tags.map((t) => `
+            <div class="tagrow">
+              <a class="chip" href="#/items?tag=${encodeURIComponent(t.name)}">${esc(t.name)}</a>
+              <span class="hint">${plural(t.item_count, 'item', 'items')}</span>
+              <div class="spacer"></div>
+              <button class="tiny" data-act="rename-tag" data-tag="${esc(t.name)}">Rename</button>
+              <button class="tiny danger" data-act="del-tag" data-tag="${esc(t.name)}">Remove</button>
+            </div>`).join('')}</div>`
+        : '<p class="hint">No tags yet.</p>'}
     </div>
 
     <div class="card settings-block">
@@ -636,11 +836,14 @@ async function submitContainer(form) {
 
 async function submitSettings(form) {
   const fd = new FormData(form);
-  const result = await api('/api/settings', {
-    method: 'PUT',
-    body: JSON.stringify({ public_url: fd.get('public_url') || '' }),
-  });
-  toast(`QR codes now point at ${result.effective_public_url}`);
+  const payload = {};
+  // The settings page has two independent forms; send only what this one owns.
+  if (fd.has('public_url')) payload.public_url = fd.get('public_url') || '';
+  if (fd.has('stale_after_days')) payload.stale_after_days = String(fd.get('stale_after_days'));
+  const result = await api('/api/settings', { method: 'PUT', body: JSON.stringify(payload) });
+  toast(fd.has('public_url')
+    ? `QR codes now point at ${result.effective_public_url}`
+    : 'Re-check window saved');
   await reload();
 }
 
@@ -658,10 +861,14 @@ const actions = {
   },
 
   'del-item': async (el) => {
-    if (!confirm('Delete this item? This cannot be undone.')) return;
+    const inVerify = el.dataset.stay === '1';
+    const question = inVerify
+      ? "Remove this from the box's contents? It'll be deleted from the inventory."
+      : 'Delete this item? This cannot be undone.';
+    if (!confirm(question)) return;
     await api(`/api/items/${el.dataset.id}`, { method: 'DELETE' });
     closeModal();
-    toast('Item deleted');
+    toast(inVerify ? 'Removed from the box' : 'Item deleted');
     await reload();
   },
 
@@ -693,6 +900,41 @@ const actions = {
     location.hash = '#/boxes';
   },
 
+  'mark-checked': async (el) => {
+    const container = await api(`/api/containers/${el.dataset.id}/verify`, { method: 'POST' });
+    toast(`${container.name} marked as checked`);
+    await refreshState();
+    if (el.dataset.return === 'box') location.hash = `#/box/${encodeURIComponent(container.code)}`;
+    else await render();
+  },
+
+  'confirm-item': (el) => {
+    const id = Number(el.dataset.id);
+    if (verified.has(id)) verified.delete(id);
+    else verified.add(id);
+    render();
+  },
+
+  'rename-tag': async (el) => {
+    const current = el.dataset.tag;
+    const next = prompt(`Rename the tag "${current}" to:`, current);
+    if (!next || next.trim() === current) return;
+    const result = await api(`/api/tags/${encodeURIComponent(current)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name: next.trim() }),
+    });
+    toast(`Tag renamed to ${result.name}`);
+    await reload();
+  },
+
+  'del-tag': async (el) => {
+    const tag = el.dataset.tag;
+    if (!confirm(`Remove the tag "${tag}" from every item? The items themselves stay.`)) return;
+    await api(`/api/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
+    toast('Tag removed');
+    await reload();
+  },
+
   'clear-photo': (el) => {
     const form = el.closest('form');
     form.querySelector('input[name=photo_id]').value = '';
@@ -711,14 +953,24 @@ const actions = {
     document.querySelectorAll('#label-list input').forEach((i) => { i.checked = false; });
   },
 
-  'print-labels': (el) => {
+  'print-labels': () => {
     const codes = [...document.querySelectorAll('#label-list input:checked')].map((i) => i.value);
     if (!codes.length) {
       toast('Tick the boxes you want labels for first', true);
       return;
     }
-    const url = `/labels?size=${el.dataset.size}&codes=${encodeURIComponent(codes.join(','))}`;
-    window.open(url, '_blank', 'noopener');
+    const format = $('#label-format').value;
+    localStorage.setItem('label-format', format);
+    const params = new URLSearchParams({ format, codes: codes.join(',') });
+    if (format === 'custom') {
+      const size = prompt('Label size in millimetres, width × height', '25 x 25');
+      if (!size) return;
+      const [w, h] = size.split(/[x×,]/).map((n) => parseFloat(n.trim()));
+      if (!w || !h) return toast('Could not read that size', true);
+      params.set('w', w);
+      params.set('h', h);
+    }
+    window.open(`/labels?${params}`, '_blank', 'noopener');
   },
 
   import: () => {
@@ -775,6 +1027,7 @@ async function render() {
   document.querySelectorAll('#tabs a').forEach((a) => {
     const active = a.dataset.route === route.name
       || (route.name === 'box' && a.dataset.route === 'boxes')
+      || (route.name === 'verify' && a.dataset.route === 'review')
       || (route.name === 'search' && a.dataset.route === 'home');
     a.classList.toggle('active', active);
   });
@@ -786,7 +1039,7 @@ async function render() {
     searchInput.value = '';
   }
   $('#search-clear').hidden = !searchInput.value;
-  $('#fab').hidden = route.name === 'settings' || route.name === 'labels';
+  $('#fab').hidden = ['settings', 'labels', 'verify', 'review'].includes(route.name);
 
   try {
     switch (route.name) {
@@ -794,6 +1047,8 @@ async function render() {
       case 'search': await viewSearch(route.arg || ''); break;
       case 'box': await viewBox(route.arg); break;
       case 'boxes': await viewBoxes(); break;
+      case 'review': await viewReview(); break;
+      case 'verify': await viewVerify(route.arg); break;
       case 'items': await viewItems(route.params); break;
       case 'labels': await viewLabels(); break;
       case 'settings': await viewSettings(); break;

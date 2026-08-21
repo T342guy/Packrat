@@ -13,6 +13,19 @@ const MAX_DEPTH: usize = 64;
 
 pub const KINDS: &[&str] = &["area", "shelf", "cabinet", "drawer", "bin", "box", "bag", "other"];
 
+/// How long a container's contents are trusted before the app suggests
+/// re-checking them. Overridable in Settings.
+pub const DEFAULT_STALE_AFTER_DAYS: i64 = 180;
+
+pub fn stale_after_days(conn: &Connection) -> i64 {
+    crate::db::get_setting(conn, "stale_after_days")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(DEFAULT_STALE_AFTER_DAYS)
+}
+
 fn kind_prefix(kind: &str) -> &'static str {
     match kind {
         "area" => "AR",
@@ -74,11 +87,15 @@ struct RawContainer {
     photo_id: Option<i64>,
     created_at: String,
     updated_at: String,
+    checked_at: Option<String>,
+    age_days: i64,
 }
 
 fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
     let mut stmt = conn.prepare(
-        "SELECT id, code, name, kind, parent_id, notes, photo_id, created_at, updated_at
+        "SELECT id, code, name, kind, parent_id, notes, photo_id, created_at, updated_at,
+                checked_at,
+                CAST(julianday('now') - julianday(COALESCE(checked_at, created_at)) AS INTEGER)
          FROM containers",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -92,6 +109,8 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
             photo_id: r.get(6)?,
             created_at: r.get(7)?,
             updated_at: r.get(8)?,
+            checked_at: r.get(9)?,
+            age_days: r.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -102,6 +121,7 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
 /// the tree work in Rust is simpler and faster than recursive SQL.
 pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
     let raw = load_raw(conn)?;
+    let threshold = stale_after_days(conn);
     let by_id: HashMap<i64, usize> = raw.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
 
     let mut direct_items: HashMap<i64, (i64, i64)> = HashMap::new();
@@ -159,6 +179,12 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
                 photo_id: c.photo_id,
                 created_at: c.created_at.clone(),
                 updated_at: c.updated_at.clone(),
+                checked_at: c.checked_at.clone(),
+                days_since_check: c.checked_at.as_ref().map(|_| c.age_days),
+                age_days: c.age_days,
+                // Only containers actually holding something can go stale:
+                // an empty shelf has nothing to verify.
+                stale: item_count > 0 && c.age_days > threshold,
                 path: names.join(" / "),
                 depth,
                 item_count,
@@ -294,6 +320,18 @@ pub fn delete_container(conn: &mut Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// Records that someone has just eyeballed this container's contents.
+pub fn mark_checked(conn: &Connection, id: i64) -> AppResult<Container> {
+    let changed = conn.execute(
+        "UPDATE containers SET checked_at = datetime('now') WHERE id = ?1",
+        [id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::not_found(format!("no container with id {id}")));
+    }
+    container_by_id(conn, id)
+}
+
 pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail> {
     let all = all_containers(conn)?;
     let container = all
@@ -319,8 +357,18 @@ pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail
     }
     ancestors.reverse();
 
-    let children: Vec<Container> =
-        all.iter().filter(|c| c.parent_id == Some(id)).cloned().collect();
+    // Each child is returned with its own contents so a shelf can show every
+    // box on it with a collapsed list of what's inside.
+    let mut children: Vec<ChildNode> = Vec::new();
+    for child in all.iter().filter(|c| c.parent_id == Some(id)) {
+        let items =
+            query_items(conn, &ItemQuery { container_id: Some(child.id), ..Default::default() })?;
+        children.push(ChildNode {
+            child_count: child.child_count,
+            container: child.clone(),
+            items,
+        });
+    }
 
     let items = query_items(conn, &ItemQuery { container_id: Some(id), ..Default::default() })?;
 
@@ -696,11 +744,62 @@ pub fn all_tags(conn: &Connection) -> AppResult<Vec<TagCount>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Renames a tag everywhere it is used. Renaming onto an existing tag merges
+/// the two rather than failing.
+pub fn rename_tag(conn: &mut Connection, old: &str, new: &str) -> AppResult<String> {
+    let new = new.trim();
+    if new.is_empty() {
+        return Err(AppError::bad_request("the new tag name cannot be empty"));
+    }
+    if new.len() > 64 {
+        return Err(AppError::bad_request("tag names are limited to 64 characters"));
+    }
+    let tx = conn.transaction()?;
+    let old_id: i64 = tx
+        .query_row("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE", [old], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("no tag called {old}")))?;
+    let existing: Option<i64> = tx
+        .query_row("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE", [new], |r| r.get(0))
+        .optional()?;
+
+    match existing {
+        Some(target) if target != old_id => {
+            tx.execute(
+                "INSERT OR IGNORE INTO item_tags (item_id, tag_id)
+                 SELECT item_id, ?1 FROM item_tags WHERE tag_id = ?2",
+                params![target, old_id],
+            )?;
+            tx.execute("DELETE FROM item_tags WHERE tag_id = ?1", [old_id])?;
+            tx.execute("DELETE FROM tags WHERE id = ?1", [old_id])?;
+        }
+        _ => {
+            tx.execute("UPDATE tags SET name = ?1 WHERE id = ?2", params![new, old_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(new.to_string())
+}
+
+/// Removes a tag from every item that carries it.
+pub fn delete_tag(conn: &Connection, name: &str) -> AppResult<()> {
+    let changed = conn.execute(
+        "DELETE FROM tags WHERE name = ?1 COLLATE NOCASE",
+        [name.trim()],
+    )?;
+    if changed == 0 {
+        return Err(AppError::not_found(format!("no tag called {name}")));
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------------- stats
 
 pub fn stats(conn: &Connection) -> AppResult<Stats> {
     let one = |sql: &str| -> AppResult<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
+    let stale_containers = all_containers(conn)?.iter().filter(|c| c.stale).count() as i64;
     Ok(Stats {
+        stale_containers,
         items: one("SELECT COUNT(*) FROM items")?,
         total_quantity: one("SELECT COALESCE(SUM(quantity), 0) FROM items")?,
         containers: one("SELECT COUNT(*) FROM containers")?,
@@ -943,6 +1042,113 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nested.len(), 1);
+    }
+
+    #[test]
+    fn containers_holding_items_go_stale_and_checking_clears_it() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        item(&mut conn, "Tent", "", Some(bin.id), &[]);
+        // Backdate it beyond the default window.
+        conn.execute(
+            "UPDATE containers SET created_at = datetime('now', '-400 days') WHERE id = ?1",
+            [bin.id],
+        )
+        .unwrap();
+
+        let before = container_by_id(&conn, bin.id).unwrap();
+        assert!(before.stale);
+        assert_eq!(before.days_since_check, None, "never checked");
+        assert!(before.age_days >= 399);
+
+        let after = mark_checked(&conn, bin.id).unwrap();
+        assert!(!after.stale);
+        assert_eq!(after.days_since_check, Some(0));
+        assert!(after.checked_at.is_some());
+    }
+
+    #[test]
+    fn empty_containers_are_never_flagged_for_a_check() {
+        let conn = test_db();
+        let shelf = container(&conn, "Shelf", "shelf", None);
+        conn.execute(
+            "UPDATE containers SET created_at = datetime('now', '-900 days') WHERE id = ?1",
+            [shelf.id],
+        )
+        .unwrap();
+        assert!(!container_by_id(&conn, shelf.id).unwrap().stale, "nothing inside to verify");
+    }
+
+    #[test]
+    fn the_staleness_window_is_configurable() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        item(&mut conn, "Tent", "", Some(bin.id), &[]);
+        conn.execute(
+            "UPDATE containers SET checked_at = datetime('now', '-60 days') WHERE id = ?1",
+            [bin.id],
+        )
+        .unwrap();
+
+        assert!(!container_by_id(&conn, bin.id).unwrap().stale, "60 days is inside the default");
+        crate::db::set_setting(&conn, "stale_after_days", "30").unwrap();
+        assert!(container_by_id(&conn, bin.id).unwrap().stale, "but outside a 30 day window");
+    }
+
+    #[test]
+    fn a_shelf_reports_each_box_with_its_contents() {
+        let mut conn = test_db();
+        let shelf = container(&conn, "Shelf", "shelf", None);
+        let camping = container(&conn, "Camping", "box", Some(shelf.id));
+        let holiday = container(&conn, "Holiday", "bin", Some(shelf.id));
+        item(&mut conn, "Tent", "", Some(camping.id), &[]);
+        item(&mut conn, "Stove", "", Some(camping.id), &[]);
+        item(&mut conn, "Wreath", "", Some(holiday.id), &[]);
+
+        let detail = container_detail(&conn, shelf.id).unwrap();
+        assert_eq!(detail.children.len(), 2);
+        let names: Vec<Vec<String>> = detail
+            .children
+            .iter()
+            .map(|c| c.items.iter().map(|i| i.name.clone()).collect())
+            .collect();
+        assert!(names.contains(&vec!["Stove".to_string(), "Tent".to_string()]));
+        assert!(names.contains(&vec!["Wreath".to_string()]));
+        assert_eq!(detail.nested_item_count, 3, "the shelf holds three things in total");
+    }
+
+    #[test]
+    fn renaming_a_tag_updates_every_item_using_it() {
+        let mut conn = test_db();
+        item(&mut conn, "Drill", "", None, &["tols"]);
+        item(&mut conn, "Saw", "", None, &["tols"]);
+        rename_tag(&mut conn, "tols", "tools").unwrap();
+
+        let tags = all_tags(&conn).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "tools");
+        assert_eq!(tags[0].item_count, 2);
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_tag_merges_them() {
+        let mut conn = test_db();
+        let drill = item(&mut conn, "Drill", "", None, &["power-tools"]);
+        item(&mut conn, "Saw", "", None, &["tools"]);
+        rename_tag(&mut conn, "power-tools", "tools").unwrap();
+
+        let tags = all_tags(&conn).unwrap();
+        assert_eq!(tags.len(), 1, "the two tags become one");
+        assert_eq!(tags[0].item_count, 2);
+        assert_eq!(item_by_id(&conn, drill.id).unwrap().tags, vec!["tools".to_string()]);
+    }
+
+    #[test]
+    fn deleting_a_tag_leaves_the_items_alone() {
+        let mut conn = test_db();
+        let drill = item(&mut conn, "Drill", "", None, &["tools", "loud"]);
+        delete_tag(&conn, "loud").unwrap();
+        assert_eq!(item_by_id(&conn, drill.id).unwrap().tags, vec!["tools".to_string()]);
     }
 
     #[test]

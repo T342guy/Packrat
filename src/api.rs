@@ -88,6 +88,28 @@ pub async fn delete_container(
     .await
 }
 
+/// Marks a container as just-verified: someone looked inside and the listing
+/// matches reality.
+pub async fn verify_container(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<Container>> {
+    db::run(&st.pool, move |c| store::mark_checked(c, id)).await.map(Json)
+}
+
+/// Containers holding items that haven't been verified within the staleness
+/// window, most overdue first.
+pub async fn stale_containers(State(st): State<AppState>) -> AppResult<Json<Value>> {
+    db::run(&st.pool, |c| {
+        let days = store::stale_after_days(c);
+        let mut stale: Vec<Container> =
+            store::all_containers(c)?.into_iter().filter(|x| x.stale).collect();
+        stale.sort_by(|a, b| b.age_days.cmp(&a.age_days));
+        Ok(Json(json!({ "stale_after_days": days, "containers": stale })))
+    })
+    .await
+}
+
 // --------------------------------------------------------------------- items
 
 pub async fn list_items(
@@ -211,6 +233,34 @@ pub async fn list_tags(State(st): State<AppState>) -> AppResult<Json<Vec<TagCoun
     db::run(&st.pool, |c| store::all_tags(c)).await.map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TagRename {
+    pub name: String,
+}
+
+pub async fn rename_tag(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<TagRename>,
+) -> AppResult<Json<Value>> {
+    db::run(&st.pool, move |c| {
+        let renamed = store::rename_tag(c, &name, &body.name)?;
+        Ok(Json(json!({ "ok": true, "name": renamed })))
+    })
+    .await
+}
+
+pub async fn delete_tag(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> AppResult<Json<Value>> {
+    db::run(&st.pool, move |c| {
+        store::delete_tag(c, &name)?;
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
 pub async fn stats(State(st): State<AppState>) -> AppResult<Json<Stats>> {
     db::run(&st.pool, |c| store::stats(c)).await.map(Json)
 }
@@ -225,6 +275,7 @@ pub async fn bootstrap(State(st): State<AppState>) -> AppResult<Json<Value>> {
             "stats": store::stats(c)?,
             "kinds": store::KINDS,
             "public_url": base_url,
+            "stale_after_days": store::stale_after_days(c),
         })))
     })
     .await
@@ -241,6 +292,7 @@ pub async fn get_settings(State(st): State<AppState>) -> AppResult<Json<Value>> 
             "public_url": stored,
             "effective_public_url": effective,
             "detected_url": detected,
+            "stale_after_days": store::stale_after_days(c),
         })))
     })
     .await
@@ -250,6 +302,23 @@ pub async fn update_settings(
     State(st): State<AppState>,
     Json(body): Json<HashMap<String, String>>,
 ) -> AppResult<Json<Value>> {
+    if let Some(raw) = body.get("stale_after_days") {
+        let days: i64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| AppError::bad_request("re-check reminder must be a number of days"))?;
+        if !(1..=3650).contains(&days) {
+            return Err(AppError::bad_request("re-check reminder must be between 1 and 3650 days"));
+        }
+        db::run(&st.pool, move |c| {
+            db::set_setting(c, "stale_after_days", &days.to_string())
+                .map_err(|e| AppError::internal(e.to_string()))
+        })
+        .await?;
+    }
+    if !body.contains_key("public_url") {
+        return Ok(Json(json!({ "ok": true, "effective_public_url": st.public_url() })));
+    }
     let url = body.get("public_url").cloned().unwrap_or_default().trim().to_string();
     let has_scheme = url.starts_with("http://") || url.starts_with("https://");
     if !url.is_empty() && !has_scheme {

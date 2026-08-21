@@ -185,12 +185,15 @@ fn router(state: AppState) -> Router {
         // What a QR code on a box resolves to.
         .route("/b/{code}", get(scan_redirect))
         .route("/labels", get(media::print_labels))
+        .route("/api/label-formats", get(media::label_formats))
         // Containers
         .route("/api/containers", get(api::list_containers).post(api::create_container))
         .route("/api/containers/{id}", get(api::get_container))
         .route("/api/containers/{id}", put(api::update_container))
         .route("/api/containers/{id}", delete(api::delete_container))
         .route("/api/containers/{id}/qr.svg", get(media::container_qr))
+        .route("/api/containers/{id}/verify", post(api::verify_container))
+        .route("/api/stale", get(api::stale_containers))
         .route("/api/by-code/{code}", get(api::get_container_by_code))
         // Items
         .route("/api/items", get(api::list_items).post(api::create_item))
@@ -203,6 +206,7 @@ fn router(state: AppState) -> Router {
         // Lookup and meta
         .route("/api/search", get(api::search))
         .route("/api/tags", get(api::list_tags))
+        .route("/api/tags/{name}", put(api::rename_tag).delete(api::delete_tag))
         .route("/api/stats", get(api::stats))
         .route("/api/bootstrap", get(api::bootstrap))
         .route("/api/settings", get(api::get_settings).put(api::update_settings))

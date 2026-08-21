@@ -93,6 +93,15 @@ pub(crate) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
     }
+
+    if version < 2 {
+        // When the contents of a container were last verified by eye. NULL
+        // means "never checked since it was created".
+        let tx = conn.transaction()?;
+        tx.execute_batch("ALTER TABLE containers ADD COLUMN checked_at TEXT")?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
