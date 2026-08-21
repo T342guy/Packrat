@@ -4,6 +4,7 @@ use crate::models::*;
 use crate::store::{self, ItemQuery};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -313,6 +314,17 @@ pub async fn delete_tag(
         Ok(Json(json!({ "ok": true })))
     })
     .await
+}
+
+/// Streams this instance's log lines as they happen. `packrat --hook-logging`
+/// is a client for it; a browser or `curl -N` works just as well.
+pub async fn log_stream(
+) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    use tokio_stream::StreamExt;
+    let stream =
+        tokio_stream::wrappers::BroadcastStream::new(crate::logging::channel().subscribe())
+            .filter_map(|line| line.ok().map(|l| Ok(Event::default().data(l))));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Liveness probe: cheap, and it touches the database so a wedged file shows
