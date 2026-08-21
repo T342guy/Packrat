@@ -111,6 +111,23 @@ jobs:
         # architecture regardless of its glibc.
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Stamp the version into the manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        # On a real release the tag already carries the bumped version, so this
+        # is a no-op. On a branch build nothing has bumped anything, and without
+        # this the archive would be named for one version while the binary
+        # inside reported another.
+        run: |
+          set -euo pipefail
+          current="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [[ "$current" != "$VERSION" ]]; then
+            sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
+            # Keeps Cargo.lock in step so the build below can stay --locked.
+            cargo metadata --format-version 1 > /dev/null
+          fi
+          grep -m1 '^version = ' Cargo.toml
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -134,8 +151,18 @@ jobs:
 
       - name: Check the binary runs
         if: matrix.target == 'x86_64-unknown-linux-musl'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          ./target/${{ matrix.target }}/release/packrat --version
+          set -euo pipefail
+          # The archive name, the git tag and what the binary says about itself
+          # all have to agree, so assert it rather than hope.
+          reported="$(./target/${{ matrix.target }}/release/packrat --version | head -1)"
+          echo "$reported"
+          if [[ "$reported" != "packrat $VERSION" ]]; then
+            echo "binary reports '$reported', expected 'packrat $VERSION'" >&2
+            exit 1
+          fi
           ./target/${{ matrix.target }}/release/packrat --db "$RUNNER_TEMP/rel.db" --port 8123 &
           for _ in $(seq 1 40); do
             curl -fsS http://127.0.0.1:8123/api/health > /dev/null 2>&1 && break

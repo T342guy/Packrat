@@ -133,6 +133,16 @@ fn parse_args() -> Result<Args, String> {
 
 #[tokio::main]
 async fn main() {
+    // Rust ignores SIGPIPE, so writing into a closed pipe returns an error and
+    // println! panics. `packrat --version | head -1` failed roughly one time in
+    // ten that way, depending on whether the reader had exited yet. Restoring
+    // the default handler makes the process end quietly, the way every other
+    // command line tool does.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if let Err(message) = run().await {
         eprintln!("packrat: {message}");
         std::process::exit(1);

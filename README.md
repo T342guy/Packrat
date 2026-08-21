@@ -380,7 +380,7 @@ scripts/        install.sh — installs the binary and registers it to autostart
 
 ## License
 
-Copyright © 2026 Packrat contributors.
+Copyright © 2026 T342guy.
 
 Packrat is free software: you can redistribute it and modify it under the terms
 of the GNU General Public License, version 3, as published by the Free Software

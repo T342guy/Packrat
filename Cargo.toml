@@ -21,6 +21,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 futures-core = "0.3.34"
+libc = "0.2.189"
 
 [[bench]]
 name = "inventory"

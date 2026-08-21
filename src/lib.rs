@@ -10,9 +10,8 @@
 
 /// The notices GPLv3 section 5(d) asks an interactive interface to display.
 /// Kept in one place so the command line, the API and the web footer cannot
-/// drift apart. Replace the holder with your own name or entity if you want
-/// personal attribution rather than a project-wide one.
-pub const COPYRIGHT: &str = "Copyright © 2026 Packrat contributors";
+/// drift apart.
+pub const COPYRIGHT: &str = "Copyright © 2026 T342guy";
 pub const LICENSE_NAME: &str = "GPL-3.0-only";
 pub const SOURCE_URL: &str = "https://github.com/T342guy/packrat";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
