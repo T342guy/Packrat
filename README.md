@@ -29,8 +29,10 @@ docker run -d --name packrat --restart unless-stopped \
   ghcr.io/t342guy/packrat:latest
 ```
 
-Images are built for x86-64 and arm64, so the same command works on a Raspberry
-Pi. `PACKRAT_PUBLIC_URL` matters here: QR codes encode an absolute address, and
+Images are built for x86-64. On a Pi or another arm64 box, take the
+`aarch64` archive from the [releases](https://github.com/T342guy/packrat/releases)
+instead, or build the image yourself with `docker build -t packrat .`.
+`PACKRAT_PUBLIC_URL` matters here: QR codes encode an absolute address, and
 inside a container Packrat can only see its own container-network address, which
 no phone can reach — so tell it the host's address on your LAN. It says so on
 startup if you forget. There's a `docker-compose.yml` in the repo if you'd
@@ -314,22 +316,52 @@ local network — which is what makes phone scanning work. Run it on a network
 you trust, and don't port-forward it to the internet. To keep it to the machine
 it runs on, use `--host 127.0.0.1` (QR scanning from a phone won't work then).
 
-## Builds
+## Builds and releases
 
-Every push runs formatting, clippy with warnings denied, the unit tests, a
-release build, and a smoke test that starts the binary and queries it. Pushes to
-`main` and version tags publish a multi-architecture container image to
-`ghcr.io/t342guy/packrat` — `latest` from `main`, plus semver tags from `v*`
-tags. The arm64 half is built under emulation, so that job takes a while; if you
-want it faster, split the build across native `ubuntu-latest` and
-`ubuntu-24.04-arm` runners and merge the manifests.
+Every push, on any branch, runs formatting, clippy with warnings denied, the
+unit tests, a release build, a smoke test that starts the binary and queries
+it, and the benchmarks. Benchmark medians are published to the job summary as
+a table; they do not gate the build, because runner timings are too noisy to
+fail on, but a regression is visible while the change is still in progress.
+
+**Container images** go to `ghcr.io/t342guy/packrat` from `main` and from `v*`
+tags, built for x86-64. Release archives additionally carry an arm64 binary for
+anyone running this on a Pi; the image is x86-64 only because building arm64
+images means emulation, which cost twenty-five minutes a push against three.
+
+**Releases** are cut automatically on every merge to `main`, or on demand from
+the Actions tab where you can choose whether to raise the patch, minor or major
+part. The workflow bumps the version in `Cargo.toml`, commits it back, tags it,
+builds statically linked binaries for x86-64 and arm64 Linux, packages each as
+both `.tar.gz` and `.zip` with the README and the installer alongside, and
+publishes a GitHub release listing every commit since the previous tag, with
+SHA-256 checksums.
+
+Versions look like `0.1.1-2026.aug.21` — the semver part says what changed, the
+date says when it was built. The day is deliberately not zero-padded: semver
+forbids leading zeros in numeric pre-release identifiers, and cargo rejects
+`0.1.1-2026.aug.05` outright. `scripts/next-version.sh` computes it and can be
+run by hand to see what the next release would be called.
+
+Pushing to any other branch runs the same build and packaging without bumping,
+tagging or publishing anything, so the pipeline can be exercised safely.
 
 ## Development
 
 ```bash
 cargo test     # search ranking, nesting, staleness, tags, scanning, Code 128
+cargo bench    # timings over synthetic inventories of 1k, 4k and 16k items
 cargo run      # debug server on :8080
 ```
+
+The benchmarks exist because a real regression got through once: opening a
+shelf re-queried every box on it separately, which was invisible on the example
+data and 16x slower on a full one. That case is now measured directly, along
+with search, scanning and listing. On a 4,000-item inventory — far larger than
+a full garage — a barcode scan resolves in about 0.14 ms and opening a box
+takes about 2 ms. Search is a `LIKE` scan and grows with the inventory: 4 ms at
+1,000 items, 90 ms at 16,000. If anyone ever fills a garage that far, that is
+the number to attack, probably with SQLite's FTS5.
 
 Layout:
 
@@ -345,3 +377,8 @@ static/         frontend, embedded into the binary at compile time
 Dockerfile      two-stage build; the runtime image is Alpine plus the binary
 scripts/        install.sh — installs the binary and registers it to autostart
 ```
+
+## License
+
+GPL-3.0-only — see [LICENSE](LICENSE). The binaries in each release ship with
+the licence text alongside them.

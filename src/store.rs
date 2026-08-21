@@ -4,6 +4,7 @@
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 /// Crockford-ish alphabet: no 0/O/1/I/L/U, so codes survive being read off a
@@ -107,6 +108,78 @@ pub fn normalize_code(code: &str) -> String {
     code.trim().to_uppercase().replace(' ', "-")
 }
 
+// --------------------------------------------------------------------- clock
+//
+// Staleness is measured against the operating system's clock, which is the
+// only sense of time a process gets across restarts. That is fine for the
+// ordinary case — stopping Packrat for six months does not hide the six
+// months, because the clock keeps running without it. It is not fine when the
+// clock itself is wrong: a machine with no battery-backed clock can boot in
+// 1970, and a clock that jumps backwards would make everything look freshly
+// checked.
+//
+// So the latest time ever observed is recorded, and time is read as "now, or
+// the high-water mark, whichever is later". A clock that moves backwards then
+// freezes the ages where they were instead of winding them back, and the
+// discrepancy is reported rather than silently absorbed.
+
+const CLOCK_KEY: &str = "clock_high_water";
+/// Small backwards steps are normal — NTP corrections, leap smearing.
+const CLOCK_TOLERANCE_SECONDS: i64 = 120;
+
+#[derive(Debug, Serialize)]
+pub struct ClockStatus {
+    pub now: String,
+    pub high_water: Option<String>,
+    /// How far behind the recorded high-water mark the system clock is, when
+    /// that gap is big enough to matter.
+    pub behind_seconds: Option<i64>,
+}
+
+/// The current time, never earlier than the latest time already seen.
+pub fn trusted_now(conn: &Connection) -> AppResult<String> {
+    Ok(conn.query_row(
+        "SELECT MAX(datetime('now'),
+                    COALESCE((SELECT value FROM settings WHERE key = ?1), datetime('now')))",
+        [CLOCK_KEY],
+        |r| r.get(0),
+    )?)
+}
+
+/// Records that time has reached at least this point.
+pub fn touch_clock(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+        [CLOCK_KEY],
+    )?;
+    Ok(())
+}
+
+pub fn clock_status(conn: &Connection) -> AppResult<ClockStatus> {
+    let (now, high_water): (String, Option<String>) = conn.query_row(
+        "SELECT datetime('now'), (SELECT value FROM settings WHERE key = ?1)",
+        [CLOCK_KEY],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let behind_seconds = match &high_water {
+        Some(mark) => {
+            let gap: i64 = conn.query_row(
+                "SELECT CAST((julianday(?1) - julianday(?2)) * 86400 AS INTEGER)",
+                [mark, &now],
+                |r| r.get(0),
+            )?;
+            (gap > CLOCK_TOLERANCE_SECONDS).then_some(gap)
+        }
+        None => None,
+    };
+    Ok(ClockStatus {
+        now,
+        high_water,
+        behind_seconds,
+    })
+}
+
 // ---------------------------------------------------------------- containers
 
 struct RawContainer {
@@ -121,17 +194,19 @@ struct RawContainer {
     created_at: String,
     updated_at: String,
     checked_at: Option<String>,
-    age_days: i64,
+    age_seconds: i64,
 }
 
 fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
+    let now = trusted_now(conn)?;
     let mut stmt = conn.prepare(
         "SELECT id, code, name, kind, parent_id, notes, photo_id, barcode, created_at, updated_at,
                 checked_at,
-                CAST(julianday('now') - julianday(COALESCE(checked_at, created_at)) AS INTEGER)
+                CAST((julianday(?1) - julianday(COALESCE(checked_at, created_at))) * 86400
+                     AS INTEGER)
          FROM containers",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map([&now], |r| {
         Ok(RawContainer {
             id: r.get(0)?,
             code: r.get(1)?,
@@ -144,10 +219,51 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
             created_at: r.get(8)?,
             updated_at: r.get(9)?,
             checked_at: r.get(10)?,
-            age_days: r.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0),
+            age_seconds: r.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Builds "Garage / Shelf / Box" paths and depths, guarding against cycles a
+/// hand-edited database could contain.
+fn build_paths(rows: &[(i64, String, Option<i64>)]) -> HashMap<i64, (String, i64)> {
+    let index: HashMap<i64, usize> = rows.iter().enumerate().map(|(i, r)| (r.0, i)).collect();
+    let mut out = HashMap::with_capacity(rows.len());
+    for (id, name, parent) in rows {
+        let mut names = vec![name.clone()];
+        let mut seen = HashSet::from([*id]);
+        let mut cursor = *parent;
+        while let Some(parent_id) = cursor {
+            if !seen.insert(parent_id) || names.len() > MAX_DEPTH {
+                break;
+            }
+            match index.get(&parent_id) {
+                Some(&i) => {
+                    names.push(rows[i].1.clone());
+                    cursor = rows[i].2;
+                }
+                None => break,
+            }
+        }
+        let depth = names.len() as i64 - 1;
+        names.reverse();
+        out.insert(*id, (names.join(" / "), depth));
+    }
+    out
+}
+
+/// Just the id-to-path map. Item queries need paths but not content counts,
+/// and the counts cost a group-by over every item in the database.
+fn container_paths(conn: &Connection) -> AppResult<HashMap<i64, String>> {
+    let mut stmt = conn.prepare("SELECT id, name, parent_id FROM containers")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<(i64, String, Option<i64>)>>>()?;
+    Ok(build_paths(&rows)
+        .into_iter()
+        .map(|(id, (path, _))| (id, path))
+        .collect())
 }
 
 /// Loads every container, enriched with its full path and content counts.
@@ -156,7 +272,6 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
 pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
     let raw = load_raw(conn)?;
     let threshold = stale_after_days(conn);
-    let by_id: HashMap<i64, usize> = raw.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
 
     let mut direct_items: HashMap<i64, (i64, i64)> = HashMap::new();
     {
@@ -184,28 +299,16 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
         }
     }
 
+    let paths = build_paths(
+        &raw.iter()
+            .map(|c| (c.id, c.name.clone(), c.parent_id))
+            .collect::<Vec<_>>(),
+    );
+
     let mut out: Vec<Container> = raw
         .iter()
         .map(|c| {
-            // Walk up to the root to build the breadcrumb path, guarding
-            // against cycles that a hand-edited database could contain.
-            let mut names = vec![c.name.clone()];
-            let mut seen = HashSet::from([c.id]);
-            let mut cursor = c.parent_id;
-            while let Some(pid) = cursor {
-                if !seen.insert(pid) || names.len() > MAX_DEPTH {
-                    break;
-                }
-                match by_id.get(&pid) {
-                    Some(&idx) => {
-                        names.push(raw[idx].name.clone());
-                        cursor = raw[idx].parent_id;
-                    }
-                    None => break,
-                }
-            }
-            let depth = names.len() as i64 - 1;
-            names.reverse();
+            let (path, depth) = paths.get(&c.id).cloned().unwrap_or((c.name.clone(), 0));
             let (item_count, total_quantity) = direct_items.get(&c.id).copied().unwrap_or((0, 0));
             Container {
                 id: c.id,
@@ -219,12 +322,14 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
                 created_at: c.created_at.clone(),
                 updated_at: c.updated_at.clone(),
                 checked_at: c.checked_at.clone(),
-                days_since_check: c.checked_at.as_ref().map(|_| c.age_days),
-                age_days: c.age_days,
+                days_since_check: c.checked_at.as_ref().map(|_| c.age_seconds / 86_400),
+                seconds_since_check: c.checked_at.as_ref().map(|_| c.age_seconds),
+                age_days: c.age_seconds / 86_400,
+                age_seconds: c.age_seconds,
                 // Only containers actually holding something can go stale:
                 // an empty shelf has nothing to verify.
-                stale: item_count > 0 && c.age_days > threshold,
-                path: names.join(" / "),
+                stale: item_count > 0 && c.age_seconds / 86_400 > threshold,
+                path,
                 depth,
                 item_count,
                 total_quantity,
@@ -406,6 +511,7 @@ pub fn delete_container(conn: &mut Connection, id: i64) -> AppResult<()> {
 
 /// Records that someone has just eyeballed this container's contents.
 pub fn mark_checked(conn: &Connection, id: i64) -> AppResult<Container> {
+    touch_clock(conn)?;
     let changed = conn.execute(
         "UPDATE containers SET checked_at = datetime('now') WHERE id = ?1",
         [id],
@@ -498,6 +604,8 @@ pub struct ItemQuery {
     /// Fetch the contents of several containers at once, so a shelf can load
     /// every box on it in one query instead of one query per box.
     pub container_ids: Option<Vec<i64>>,
+    /// Restrict to specific item ids.
+    pub ids: Option<Vec<i64>>,
     pub include_nested: bool,
     pub tag: Option<String>,
     pub unfiled: bool,
@@ -532,6 +640,16 @@ pub fn query_items(conn: &Connection, query: &ItemQuery) -> AppResult<Vec<Item>>
     );
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+    if let Some(ids) = &query.ids {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(" AND i.id IN ({placeholders})"));
+        for id in ids {
+            binds.push(Box::new(*id));
+        }
+    }
     if let Some(ids) = &query.container_ids {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -677,12 +795,20 @@ fn attach_tags(conn: &Connection, items: &mut [Item]) -> AppResult<()> {
         return Ok(());
     }
     let mut map: HashMap<i64, Vec<String>> = HashMap::new();
-    let mut stmt = conn.prepare(
+    // Scoped to these items: reading every tag link in the database to decorate
+    // a single scanned item was the difference between a scan costing under a
+    // millisecond and costing tens.
+    let placeholders = items.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let mut stmt = conn.prepare(&format!(
         "SELECT it.item_id, t.name FROM item_tags it
          JOIN tags t ON t.id = it.tag_id
-         ORDER BY t.name COLLATE NOCASE",
-    )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+         WHERE it.item_id IN ({placeholders})
+         ORDER BY t.name COLLATE NOCASE"
+    ))?;
+    let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
+    let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
     for row in rows {
         let (item_id, tag) = row?;
         map.entry(item_id).or_default().push(tag);
@@ -699,10 +825,7 @@ fn attach_paths(conn: &Connection, items: &mut [Item]) -> AppResult<()> {
     if !items.iter().any(|i| i.container_id.is_some()) {
         return Ok(());
     }
-    let paths: HashMap<i64, String> = all_containers(conn)?
-        .into_iter()
-        .map(|c| (c.id, c.path))
-        .collect();
+    let paths = container_paths(conn)?;
     for item in items.iter_mut() {
         if let Some(cid) = item.container_id {
             item.container_path = paths.get(&cid).cloned();
@@ -712,10 +835,16 @@ fn attach_paths(conn: &Connection, items: &mut [Item]) -> AppResult<()> {
 }
 
 pub fn item_by_id(conn: &Connection, id: i64) -> AppResult<Item> {
-    let mut items = query_items(conn, &ItemQuery::default())?
-        .into_iter()
-        .filter(|i| i.id == id)
-        .collect::<Vec<_>>();
+    // Fetch the one row. This used to load the whole items table and filter in
+    // Rust, so every scan, edit and quantity change cost a full table walk plus
+    // a scan of every tag link.
+    let mut items = query_items(
+        conn,
+        &ItemQuery {
+            ids: Some(vec![id]),
+            ..Default::default()
+        },
+    )?;
     if items.is_empty() {
         return Err(AppError::not_found(format!("no item with id {id}")));
     }
@@ -834,6 +963,13 @@ pub fn adjust_quantity(conn: &Connection, id: i64, delta: i64) -> AppResult<Item
 // ---------------------------------------------------------------------- tags
 
 fn set_tags(conn: &Connection, item_id: i64, tags: &[String]) -> AppResult<()> {
+    // Remember what this item was tagged with: only those tags can be orphaned
+    // by this change, so only those need checking afterwards.
+    let previous: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT tag_id FROM item_tags WHERE item_id = ?1")?;
+        let rows = stmt.query_map([item_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<i64>>>()?
+    };
     conn.execute("DELETE FROM item_tags WHERE item_id = ?1", [item_id])?;
     let mut seen: HashSet<String> = HashSet::new();
     for raw in tags {
@@ -855,7 +991,15 @@ fn set_tags(conn: &Connection, item_id: i64, tags: &[String]) -> AppResult<()> {
             params![item_id, tag_id],
         )?;
     }
-    prune_tags(conn)?;
+    // Sweeping the whole tag table here made saving one item cost a scan of
+    // every tag link in the database.
+    for tag_id in previous {
+        conn.execute(
+            "DELETE FROM tags WHERE id = ?1
+              AND NOT EXISTS (SELECT 1 FROM item_tags WHERE tag_id = ?1)",
+            [tag_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1529,6 +1673,65 @@ mod tests {
         let b = with_barcode(&mut conn, "Saw", "", None);
         assert_eq!(a.barcode, None);
         assert_eq!(b.barcode, None);
+    }
+
+    #[test]
+    fn ages_are_reported_in_seconds_not_whole_days() {
+        let conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        conn.execute(
+            "UPDATE containers SET created_at = datetime('now', '-40 minutes') WHERE id = ?1",
+            [bin.id],
+        )
+        .unwrap();
+        let loaded = container_by_id(&conn, bin.id).unwrap();
+        assert_eq!(loaded.age_days, 0, "less than a day old");
+        // Whole days alone cannot tell 40 minutes from 20 hours.
+        assert!(
+            (2350..2450).contains(&loaded.age_seconds),
+            "expected about 2400 seconds, got {}",
+            loaded.age_seconds
+        );
+    }
+
+    #[test]
+    fn a_clock_that_moves_backwards_does_not_refresh_anything() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        item(&mut conn, "Tent", "", Some(bin.id), &[]);
+        conn.execute(
+            "UPDATE containers SET checked_at = datetime('now', '-300 days') WHERE id = ?1",
+            [bin.id],
+        )
+        .unwrap();
+        assert!(container_by_id(&conn, bin.id).unwrap().stale);
+
+        // The machine has seen time run a year past the current clock reading,
+        // as it would after a clock is wound back or a dead RTC resets.
+        crate::db::set_setting(&conn, "clock_high_water", "2099-01-01 00:00:00").unwrap();
+
+        let after = container_by_id(&conn, bin.id).unwrap();
+        assert!(
+            after.stale,
+            "winding the clock back must not clear a check-up"
+        );
+        assert!(
+            after.age_days > 300,
+            "age is measured from the latest time seen, not the earlier clock"
+        );
+
+        let status = clock_status(&conn).unwrap();
+        assert!(
+            status.behind_seconds.unwrap() > 0,
+            "and the discrepancy is reported"
+        );
+    }
+
+    #[test]
+    fn a_normal_clock_reports_no_discrepancy() {
+        let conn = test_db();
+        touch_clock(&conn).unwrap();
+        assert_eq!(clock_status(&conn).unwrap().behind_seconds, None);
     }
 
     #[test]

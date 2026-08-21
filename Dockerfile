@@ -9,6 +9,12 @@ WORKDIR /src
 # Build the dependency graph on its own layer so editing the app doesn't
 # recompile every crate.
 COPY Cargo.toml Cargo.lock ./
+# benches/ has to be here too: Cargo.toml declares a bench target and cargo
+# refuses to parse a manifest whose declared targets are missing from disk.
+# Copying the real directory rather than faking a file means renaming a bench
+# cannot quietly break this layer. cargo build does not compile benches, so
+# this costs nothing but the copy.
+COPY benches ./benches
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
@@ -23,7 +29,7 @@ FROM alpine:3.21
 LABEL org.opencontainers.image.title="Packrat" \
       org.opencontainers.image.description="Self-hosted inventory for garages, sheds and storage" \
       org.opencontainers.image.source="https://github.com/T342guy/packrat" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="GPL-3.0-only"
 
 # Unprivileged by default. The uid is fixed so a bind-mounted data directory
 # can be chowned to match it from the host.
@@ -37,9 +43,12 @@ USER packrat
 VOLUME ["/data"]
 EXPOSE 8080
 
+# Containers log by default: stdout is where `docker logs` and every log
+# shipper look, and a container with no output is hard to diagnose.
 ENV PACKRAT_DB=/data/inventory.db \
     PACKRAT_HOST=0.0.0.0 \
-    PACKRAT_PORT=8080
+    PACKRAT_PORT=8080 \
+    PACKRAT_LOG_LEVEL=info
 
 # Touches the database, so a wedged file shows up as unhealthy rather than
 # merely quiet.

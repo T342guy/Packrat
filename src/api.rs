@@ -4,6 +4,7 @@ use crate::models::*;
 use crate::store::{self, ItemQuery};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,6 +29,7 @@ impl From<ItemQueryParams> for ItemQuery {
             q: p.q.filter(|s| !s.trim().is_empty()),
             container_id: p.container,
             container_ids: None,
+            ids: None,
             include_nested: p.nested,
             tag: p.tag.filter(|s| !s.trim().is_empty()),
             unfiled: p.unfiled,
@@ -315,6 +317,17 @@ pub async fn delete_tag(
     .await
 }
 
+/// Streams this instance's log lines as they happen. `packrat --hook-logging`
+/// is a client for it; a browser or `curl -N` works just as well.
+pub async fn log_stream(
+) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    use tokio_stream::StreamExt;
+    let stream =
+        tokio_stream::wrappers::BroadcastStream::new(crate::logging::channel().subscribe())
+            .filter_map(|line| line.ok().map(|l| Ok(Event::default().data(l))));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 /// Liveness probe: cheap, and it touches the database so a wedged file shows
 /// up as unhealthy rather than merely quiet.
 pub async fn health(State(st): State<AppState>) -> AppResult<Json<Value>> {
@@ -324,6 +337,7 @@ pub async fn health(State(st): State<AppState>) -> AppResult<Json<Value>> {
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
             "containers": containers,
+            "clock": store::clock_status(c)?,
         })))
     })
     .await
@@ -344,6 +358,7 @@ pub async fn bootstrap(State(st): State<AppState>) -> AppResult<Json<Value>> {
             "kinds": store::KINDS,
             "public_url": base_url,
             "stale_after_days": store::stale_after_days(c),
+            "clock": store::clock_status(c)?,
         })))
     })
     .await

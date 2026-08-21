@@ -18,8 +18,12 @@ pub struct Container {
     pub checked_at: Option<String>,
     /// Days since that check; `None` when it has never been checked.
     pub days_since_check: Option<i64>,
+    /// Seconds since that check, for wording finer than a day.
+    pub seconds_since_check: Option<i64>,
     /// Days since the check, or since it was created if never checked.
     pub age_days: i64,
+    /// The same span in seconds, so the UI can say "20 minutes ago".
+    pub age_seconds: i64,
     /// Holds items and hasn't been verified within the staleness window.
     pub stale: bool,
     /// "Garage / North shelves / Camping bin" — computed, not stored.

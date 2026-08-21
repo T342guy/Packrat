@@ -14,8 +14,14 @@ const esc = (s) =>
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
-function agoLabel(days) {
-  if (days <= 0) return 'today';
+/** Wording for an elapsed span given in seconds. */
+function agoLabel(seconds) {
+  if (seconds < 45) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.round(seconds / 3600);
+  if (hours < 36) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.round(seconds / 86400);
   if (days === 1) return 'yesterday';
   if (days < 31) return `${days} days ago`;
   const months = Math.round(days / 30.4);
@@ -27,8 +33,8 @@ function agoLabel(days) {
 /** "Checked 3 months ago" / "Never checked — added a year ago". */
 function checkLabel(container) {
   return container.checked_at
-    ? `Checked ${agoLabel(container.days_since_check)}`
-    : `Never checked — added ${agoLabel(container.age_days)}`;
+    ? `Checked ${agoLabel(container.seconds_since_check)}`
+    : `Never checked — added ${agoLabel(container.age_seconds)}`;
 }
 
 function staleBadge(container) {
@@ -65,6 +71,7 @@ const state = {
   stats: {},
   kinds: [],
   publicUrl: '',
+  clock: null,
 };
 
 async function refreshState() {
@@ -74,6 +81,7 @@ async function refreshState() {
   state.stats = data.stats;
   state.kinds = data.kinds;
   state.publicUrl = data.public_url;
+  state.clock = data.clock;
 }
 
 const containerById = (id) => state.containers.find((c) => c.id === Number(id));
@@ -232,6 +240,15 @@ async function viewHome() {
       <div class="card stat"><div class="n">${s.containers}</div><div class="l">boxes &amp; places</div></div>
       <div class="card stat"><div class="n">${s.unfiled_items}</div><div class="l">not filed yet</div></div>
     </div>
+
+    ${state.clock && state.clock.behind_seconds
+      ? `<div class="card notice clock-warning">
+           <strong>&#9888; This machine&#39;s clock is behind</strong>
+           <span>It reads ${agoLabel(state.clock.behind_seconds)} earlier than the last time
+             Packrat ran. Check-up ages are measured against the later of the two, so nothing is
+             wrongly marked as freshly checked &mdash; but the clock is worth fixing.</span>
+         </div>`
+      : ''}
 
     ${s.stale_containers
       ? `<a class="card notice" href="#/review">
