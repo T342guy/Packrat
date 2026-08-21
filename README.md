@@ -314,15 +314,33 @@ local network — which is what makes phone scanning work. Run it on a network
 you trust, and don't port-forward it to the internet. To keep it to the machine
 it runs on, use `--host 127.0.0.1` (QR scanning from a phone won't work then).
 
-## Builds
+## Builds and releases
 
 Every push runs formatting, clippy with warnings denied, the unit tests, a
-release build, and a smoke test that starts the binary and queries it. Pushes to
-`main` and version tags publish a multi-architecture container image to
-`ghcr.io/t342guy/packrat` — `latest` from `main`, plus semver tags from `v*`
-tags. The arm64 half is built under emulation, so that job takes a while; if you
-want it faster, split the build across native `ubuntu-latest` and
-`ubuntu-24.04-arm` runners and merge the manifests.
+release build, and a smoke test that starts the binary and queries it. The
+benchmarks run on `main` and on demand, publishing their medians to the job
+summary without gating the build.
+
+**Container images** go to `ghcr.io/t342guy/packrat` from `main` and from `v*`
+tags, built for x86-64 and arm64. The arm64 half goes through emulation, so
+that job takes a while.
+
+**Releases** are cut automatically on every merge to `main`, or on demand from
+the Actions tab where you can choose whether to raise the patch, minor or major
+part. The workflow bumps the version in `Cargo.toml`, commits it back, tags it,
+builds statically linked binaries for x86-64 and arm64 Linux, packages each as
+both `.tar.gz` and `.zip` with the README and the installer alongside, and
+publishes a GitHub release listing every commit since the previous tag, with
+SHA-256 checksums.
+
+Versions look like `0.1.1-2026.aug.21` — the semver part says what changed, the
+date says when it was built. The day is deliberately not zero-padded: semver
+forbids leading zeros in numeric pre-release identifiers, and cargo rejects
+`0.1.1-2026.aug.05` outright. `scripts/next-version.sh` computes it and can be
+run by hand to see what the next release would be called.
+
+Pushing to any other branch runs the same build and packaging without bumping,
+tagging or publishing anything, so the pipeline can be exercised safely.
 
 ## Development
 
