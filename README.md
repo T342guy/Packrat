@@ -316,10 +316,11 @@ it runs on, use `--host 127.0.0.1` (QR scanning from a phone won't work then).
 
 ## Builds and releases
 
-Every push runs formatting, clippy with warnings denied, the unit tests, a
-release build, and a smoke test that starts the binary and queries it. The
-benchmarks run on `main` and on demand, publishing their medians to the job
-summary without gating the build.
+Every push, on any branch, runs formatting, clippy with warnings denied, the
+unit tests, a release build, a smoke test that starts the binary and queries
+it, and the benchmarks. Benchmark medians are published to the job summary as
+a table; they do not gate the build, because runner timings are too noisy to
+fail on, but a regression is visible while the change is still in progress.
 
 **Container images** go to `ghcr.io/t342guy/packrat` from `main` and from `v*`
 tags, built for x86-64 and arm64. The arm64 half goes through emulation, so

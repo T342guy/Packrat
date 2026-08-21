@@ -2,12 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main, "claude/**"]
   pull_request:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# A newer push to the same branch makes the older run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -53,9 +57,9 @@ jobs:
 
   bench:
     name: Benchmarks
-    # Informational, not a gate: runner timings are too noisy to fail a build
-    # on, but the numbers are worth having on the record for each change.
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # Runs on every branch: a regression is worth knowing about while the
+    # change is still in progress, not after it lands. Informational rather
+    # than a gate — runner timings are too noisy to fail a build on.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
