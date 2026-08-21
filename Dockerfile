@@ -9,6 +9,12 @@ WORKDIR /src
 # Build the dependency graph on its own layer so editing the app doesn't
 # recompile every crate.
 COPY Cargo.toml Cargo.lock ./
+# benches/ has to be here too: Cargo.toml declares a bench target and cargo
+# refuses to parse a manifest whose declared targets are missing from disk.
+# Copying the real directory rather than faking a file means renaming a bench
+# cannot quietly break this layer. cargo build does not compile benches, so
+# this costs nothing but the copy.
+COPY benches ./benches
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
