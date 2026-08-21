@@ -213,6 +213,9 @@ pub async fn bulk_move(
     Json(input): Json<BulkMoveInput>,
 ) -> AppResult<Json<Value>> {
     db::run(&st.pool, move |c| {
+        if let Some(cid) = input.container_id {
+            store::assert_can_hold_items_pub(c, cid)?;
+        }
         let tx = c.transaction()?;
         for id in &input.item_ids {
             tx.execute(
@@ -357,6 +360,7 @@ pub async fn bootstrap(State(st): State<AppState>) -> AppResult<Json<Value>> {
             "tags": store::all_tags(c)?,
             "stats": store::stats(c)?,
             "kinds": store::KINDS,
+            "container_only_kinds": store::CONTAINER_ONLY_KINDS,
             "public_url": base_url,
             "stale_after_days": store::stale_after_days(c),
             "clock": store::clock_status(c)?,

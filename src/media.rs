@@ -304,8 +304,7 @@ pub struct LabelParams {
     /// Comma-separated label codes, e.g. `BX-7K3Q,BN-2M9F`.
     pub codes: Option<String>,
     /// Print labels for every container.
-    #[serde(default)]
-    pub all: bool,
+    pub all: Option<String>,
     /// Label stock: one of `LABEL_FORMATS`, or `custom` with `w`/`h`.
     pub format: Option<String>,
     /// Legacy alias kept working: `large` / `small` sheet layouts.
@@ -317,6 +316,18 @@ pub struct LabelParams {
     pub symbols: Option<String>,
     /// Cut-and-tape margins on paper sheets: `on` (default) or `off`.
     pub tape: Option<String>,
+    /// Render only the labels, for embedding as a live preview in the app.
+    pub embed: Option<String>,
+}
+
+/// Query strings carry `1`, `yes` and `on` as often as `true`, and serde's
+/// bool deserializer rejects all but the last. Rejecting `?all=1` with a
+/// deserialization error is not a useful answer.
+fn truthy(value: &Option<String>) -> bool {
+    matches!(
+        value.as_deref().map(str::trim),
+        Some("1" | "true" | "yes" | "on" | "")
+    )
 }
 
 pub fn escape_html(s: &str) -> String {
@@ -470,12 +481,19 @@ pub async fn print_labels(
     };
     let on_paper = format.page_mm.is_none();
 
-    let wanted: Option<Vec<String>> = params.codes.as_ref().filter(|_| !params.all).map(|c| {
-        c.split(',')
-            .map(store::normalize_code)
-            .filter(|s| !s.is_empty())
-            .collect()
-    });
+    let print_everything = truthy(&params.all);
+    let embed = truthy(&params.embed);
+    let wanted: Option<Vec<String>> =
+        params
+            .codes
+            .as_ref()
+            .filter(|_| !print_everything)
+            .map(|c| {
+                c.split(',')
+                    .map(store::normalize_code)
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
 
     let label_width = format
         .page_mm
@@ -558,21 +576,27 @@ pub async fn print_labels(
             format,
             &layout,
             tape,
+            embed,
             "<p class=\"empty\">No containers matched. Add a box first, then print its label.</p>"
                 .into(),
         )));
     }
 
     let mut body = String::new();
-    body.push_str(&toolbar(
-        format,
-        symbols,
-        want_qr,
-        want_barcode,
-        &layout,
-        on_paper,
-        tape,
-    ));
+    // The embedded preview is the labels alone: the app page around it owns
+    // the controls, so a second copy of them here would be the confusion this
+    // was meant to remove.
+    if !embed {
+        body.push_str(&toolbar(
+            format,
+            symbols,
+            want_qr,
+            want_barcode,
+            &layout,
+            on_paper,
+            tape,
+        ));
+    }
     body.push_str(&format!(
         "<div class=\"sheet {}\">",
         if on_paper { "paper" } else { "roll" }
@@ -688,7 +712,9 @@ pub async fn print_labels(
         ));
     }
     body.push_str("</div>");
-    Ok(Html(page_shell("Labels", format, &layout, tape, body)))
+    Ok(Html(page_shell(
+        "Labels", format, &layout, tape, embed, body,
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -857,6 +883,7 @@ fn page_shell(
     format: &LabelFormat,
     layout: &Layout,
     tape: bool,
+    embed: bool,
     body: String,
 ) -> String {
     // Roll stock prints one label per page at the exact label size; sheet stock
@@ -892,6 +919,8 @@ fn page_shell(
     };
     let qr = layout.qr_mm;
     let bar_height = BAR_HEIGHT_MM;
+    let body_padding = if embed { "10px" } else { "16px" };
+    let body_background = if embed { "#ffffff" } else { "#f6f7f9" };
     format!(
         r#"<!doctype html>
 <html lang="en"><head>
@@ -901,7 +930,7 @@ fn page_shell(
 <style>
   * {{ box-sizing: border-box; }}
   body {{ font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-         margin: 0; padding: 16px; color: #111; background: #f6f7f9; }}
+         margin: 0; padding: {body_padding}; color: #111; background: {body_background}; }}
   .toolbar {{ display: flex; gap: 14px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }}
   .toolbar button {{ font: inherit; font-weight: 600; padding: 9px 16px; border-radius: 8px;
                      border: 0; background: #b45309; color: #fff; cursor: pointer; }}

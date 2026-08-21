@@ -43,6 +43,38 @@ fn kind_prefix(kind: &str) -> &'static str {
     }
 }
 
+/// Kinds that exist to hold other containers rather than loose items. An area
+/// is a place — a garage, a shed, a basement — and things live in the shelves
+/// and boxes inside it, not scattered directly in the room.
+pub const CONTAINER_ONLY_KINDS: &[&str] = &["area"];
+
+pub fn holds_items(kind: &str) -> bool {
+    !CONTAINER_ONLY_KINDS.contains(&kind)
+}
+
+/// Checks a container exists and is allowed to hold items.
+pub fn assert_can_hold_items_pub(conn: &Connection, id: i64) -> AppResult<()> {
+    assert_can_hold_items(conn, id)
+}
+
+fn assert_can_hold_items(conn: &Connection, id: i64) -> AppResult<()> {
+    let found: Option<(String, String)> = conn
+        .query_row(
+            "SELECT kind, name FROM containers WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match found {
+        None => Err(AppError::bad_request("container does not exist")),
+        Some((kind, name)) if !holds_items(&kind) => Err(AppError::bad_request(format!(
+            "{name} is an area, which holds boxes and shelves rather than items. \
+             Put the item in something inside it."
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
 pub fn normalize_kind(kind: &str) -> String {
     let k = kind.trim().to_lowercase();
     if KINDS.contains(&k.as_str()) {
@@ -464,6 +496,19 @@ pub fn update_container(
             .unwrap_or_default(),
     };
 
+    if !holds_items(&kind) {
+        let held: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM items WHERE container_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if held > 0 {
+            return Err(AppError::bad_request(format!(
+                "this holds {held} item(s), and an area holds only boxes and shelves. \
+                 Move them somewhere inside it first."
+            )));
+        }
+    }
     let barcode = normalize_barcode(input.barcode.as_deref());
     check_barcode_free(conn, "containers", &barcode, Some(id))?;
     conn.execute(
@@ -858,14 +903,7 @@ pub fn create_item(conn: &mut Connection, input: &ItemInput) -> AppResult<Item> 
         return Err(AppError::bad_request("name is required"));
     }
     if let Some(cid) = input.container_id {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM containers WHERE id = ?1)",
-            [cid],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Err(AppError::bad_request("container does not exist"));
-        }
+        assert_can_hold_items(conn, cid)?;
     }
     let barcode = normalize_barcode(input.barcode.as_deref());
     check_barcode_free(conn, "items", &barcode, None)?;
@@ -892,6 +930,9 @@ pub fn update_item(conn: &mut Connection, id: i64, input: &ItemInput) -> AppResu
     let name = input.name.trim();
     if name.is_empty() {
         return Err(AppError::bad_request("name is required"));
+    }
+    if let Some(cid) = input.container_id {
+        assert_can_hold_items(conn, cid)?;
     }
     let barcode = normalize_barcode(input.barcode.as_deref());
     check_barcode_free(conn, "items", &barcode, Some(id))?;
@@ -930,14 +971,7 @@ pub fn delete_item(conn: &Connection, id: i64) -> AppResult<()> {
 
 pub fn move_item(conn: &Connection, id: i64, container_id: Option<i64>) -> AppResult<Item> {
     if let Some(cid) = container_id {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM containers WHERE id = ?1)",
-            [cid],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Err(AppError::bad_request("container does not exist"));
-        }
+        assert_can_hold_items(conn, cid)?;
     }
     let changed = conn.execute(
         "UPDATE items SET container_id = ?1, updated_at = datetime('now') WHERE id = ?2",
@@ -1733,6 +1767,92 @@ mod tests {
         let conn = test_db();
         touch_clock(&conn).unwrap();
         assert_eq!(clock_status(&conn).unwrap().behind_seconds, None);
+    }
+
+    #[test]
+    fn an_area_cannot_hold_items_directly() {
+        let mut conn = test_db();
+        let garage = container(&conn, "Garage", "area", None);
+        let shelf = container(&conn, "Shelf", "shelf", Some(garage.id));
+
+        let rejected = create_item(
+            &mut conn,
+            &ItemInput {
+                name: "Tent".into(),
+                description: String::new(),
+                quantity: 1,
+                container_id: Some(garage.id),
+                photo_id: None,
+                tags: vec![],
+                barcode: None,
+            },
+        );
+        assert!(rejected.is_err());
+        assert!(rejected.unwrap_err().message.contains("area"));
+
+        // The shelf inside it is fine.
+        let tent = item(&mut conn, "Tent", "", Some(shelf.id), &[]);
+        // And it cannot be moved up into the area afterwards.
+        assert!(move_item(&conn, tent.id, Some(garage.id)).is_err());
+    }
+
+    #[test]
+    fn a_container_holding_items_cannot_become_an_area() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        item(&mut conn, "Tent", "", Some(bin.id), &[]);
+
+        let input = ContainerInput {
+            name: "Camping".into(),
+            kind: "area".into(),
+            parent_id: None,
+            notes: String::new(),
+            photo_id: None,
+            code: None,
+            barcode: None,
+        };
+        let rejected = update_container(&conn, bin.id, &input);
+        assert!(rejected.is_err(), "{:?}", rejected.map(|c| c.kind));
+        assert!(rejected.unwrap_err().message.contains("holds 1 item"));
+    }
+
+    #[test]
+    fn an_empty_container_can_still_become_an_area() {
+        let conn = test_db();
+        let bin = container(&conn, "Corner", "box", None);
+        let input = ContainerInput {
+            name: "Corner".into(),
+            kind: "area".into(),
+            parent_id: None,
+            notes: String::new(),
+            photo_id: None,
+            code: None,
+            barcode: None,
+        };
+        assert_eq!(
+            update_container(&conn, bin.id, &input).unwrap().kind,
+            "area"
+        );
+    }
+
+    #[test]
+    fn items_already_in_an_area_are_unfiled_by_migration() {
+        let mut conn = test_db();
+        let garage = container(&conn, "Garage", "area", None);
+        let tent = item(&mut conn, "Tent", "", None, &[]);
+        // Simulate a database written before the rule existed.
+        conn.execute(
+            "UPDATE items SET container_id = ?1 WHERE id = ?2",
+            [garage.id, tent.id],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        crate::db::migrate(&mut conn).unwrap();
+
+        let after = item_by_id(&conn, tent.id).unwrap();
+        assert_eq!(after.container_id, None, "kept, but unfiled");
+        assert_eq!(after.name, "Tent");
     }
 
     #[test]
