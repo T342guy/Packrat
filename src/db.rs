@@ -121,6 +121,27 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
     }
+
+    if version < 4 {
+        // Areas hold containers, not loose items. Anything already sitting
+        // directly in one becomes unfiled rather than being deleted or moved
+        // somewhere arbitrary — the app surfaces unfiled items prominently, so
+        // they are easy to put right.
+        let tx = conn.transaction()?;
+        let moved = tx.execute(
+            "UPDATE items SET container_id = NULL
+              WHERE container_id IN (SELECT id FROM containers WHERE kind = 'area')",
+            [],
+        )?;
+        if moved > 0 {
+            tracing::warn!(
+                items = moved,
+                "areas no longer hold items directly; moved them to unfiled"
+            );
+        }
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 

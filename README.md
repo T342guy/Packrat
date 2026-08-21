@@ -10,6 +10,11 @@ without opening it.** Every box gets a printed label with a QR code and a
 barcode — scan it with a phone or a barcode scanner and its contents open on
 screen.
 
+> [!WARNING]
+> Hey there! This is a work in progress project, and SHOULD BE USED WITH CARE!\
+> I can guarantee that there are a lot of bugs that have not been found yet, and a lot of missing features that are missing.\
+> Please DO make issues, pull requests, or whatever you want to do to help this project! 
+
 ## Quick start
 
 Three ways in, in increasing order of permanence.
@@ -158,7 +163,10 @@ stock at least 48 mm wide.
 
 ### Label stock, including DYMO printers
 
-The print page lays labels out for the stock you choose. DYMO (and other
+**Print labels** is one page: pick the stock, pick the symbols, tick the boxes
+you want, and the preview beside the list is the real renderer showing exactly
+what will come out. Printing prints that preview. Opening it from a box's page
+arrives with that box already ticked. DYMO (and other
 label-printer) formats print **one label per page at the exact label size**,
 which is how a LabelWriter expects to be driven from a browser.
 
@@ -174,7 +182,7 @@ which is how a LabelWriter expects to be driven from a browser.
 | Custom size… | any width × height in mm | scaled automatically to the space |
 
 Each label can carry a **QR code**, a **Code 128 barcode**, or both — the
-`Symbols` picker on the print page.
+`Symbols` picker.
 
 Both symbols compete for the same millimetres, so the layout is worked out per
 stock rather than fixed. On a label that is wide but short the barcode sits
@@ -188,6 +196,10 @@ The default, *Automatic*, will not buy a barcode at the price of an unreadable
 QR: on 1″ and 1″ × 2⅛″ stock it prints the QR alone (0.43–0.57 mm per module),
 and from 2¼″ upwards it prints both. Ask for both explicitly on small stock and
 you'll get them, with a warning saying how tight they are.
+
+`/labels` also answers directly, without the app around it, if you want to
+bookmark a set or fetch one with `curl`: `?codes=`, `?all=1`, `?format=`,
+`?symbols=`, `?tape=off`, and `?embed=1` for the bare labels the app embeds.
 
 In the print dialog: choose the LabelWriter, set the label size to the matching
 stock, margins to **none**, and scale to **100%** with "fit to page" off.
@@ -205,6 +217,16 @@ if you'd rather fit more on a sheet.
 They are drawn with rules and text rather than shading, because browsers drop
 background graphics from printouts by default. Roll stock skips them: it's
 peel-and-stick, and the space is too precious.
+
+### Areas hold containers, not items
+
+An area — a garage, a shed, a basement — is a place, and things belong in the
+shelves and boxes inside it rather than loose in the room. Packrat enforces
+that: an area's page offers to add a box or shelf rather than an item, areas
+don't appear when choosing where an item lives, and the API refuses an item
+assigned to one. Every container's page can add another container inside
+itself, so building out a shelf's worth of boxes doesn't mean going back to
+the overview each time.
 
 On the 1″ square stock the QR is 16 mm across, which scans fine from a phone —
 but the QR encodes the full URL, so a short base address (`http://192.168.1.24:8080`)
