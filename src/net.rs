@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 use std::net::{IpAddr, UdpSocket};
 
 /// Best-effort discovery of the address other devices on the LAN can reach

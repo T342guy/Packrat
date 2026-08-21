@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;

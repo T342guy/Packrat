@@ -380,5 +380,14 @@ scripts/        install.sh — installs the binary and registers it to autostart
 
 ## License
 
-GPL-3.0-only — see [LICENSE](LICENSE). The binaries in each release ship with
-the licence text alongside them.
+Copyright © 2026 Packrat contributors.
+
+Packrat is free software: you can redistribute it and modify it under the terms
+of the GNU General Public License, version 3, as published by the Free Software
+Foundation. It is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY — without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text.
+
+A running instance serves the licence at `/license` and shows the same notice
+in its footer, so an offline machine can still show a user their rights. Every
+release archive carries `LICENSE` alongside the binary.

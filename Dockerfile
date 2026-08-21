@@ -21,6 +21,8 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
 
 COPY src ./src
 COPY static ./static
+# Compiled into the binary to serve at /license, so it must be in the context.
+COPY LICENSE ./
 # Cargo skips a rebuild when only mtimes look stale, so nudge the entrypoint.
 RUN touch src/main.rs && cargo build --release --locked
 

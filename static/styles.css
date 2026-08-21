@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 /* Packrat — mobile-first, no build step, no external assets. */
 
 :root {
@@ -412,3 +413,23 @@ details.childbox > .list { border-top: 1px solid var(--border); }
 .scan-line.warn, .scan-line.error { color: var(--danger); }
 
 .notice.clock-warning { border-left-color: var(--danger); }
+
+/* -------------------------------------------------------------- site footer */
+
+.site-footer {
+  max-width: 1100px;
+  margin: 40px auto 0;
+  padding: 18px 14px 28px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.footer-line { display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.footer-line span { max-width: 78ch; }
+.site-footer strong { color: var(--text); font-weight: 600; }
+.site-footer a { color: var(--muted); text-decoration: underline; }
+.site-footer a:hover { color: var(--link); }

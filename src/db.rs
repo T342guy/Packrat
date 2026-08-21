@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 use crate::error::{AppError, AppResult};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;

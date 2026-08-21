@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Photos, QR codes and printable labels — the "know what's in the box
 //! without opening it" half of the app.
 
