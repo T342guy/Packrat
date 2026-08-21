@@ -130,17 +130,37 @@ which is how a LabelWriter expects to be driven from a browser.
 | Custom size… | any width × height in mm | scaled automatically to the space |
 
 Each label can carry a **QR code**, a **Code 128 barcode**, or both — the
-`Symbols` picker on the print page. The default, *Automatic*, prints both on
-stock at least 48 mm wide and QR only on anything narrower, because a barcode's
-bars get too fine to scan on a small label. The print page always tells you the
-exact bar width it is about to produce (a 1D laser generally needs 0.30 mm or
-more): a 2¼″ label gives 0.41 mm, a 4″ shipping label 0.74 mm. When a barcode is
-included on short stock, the QR shrinks and the contents list is dropped so
-nothing spills off the label.
+`Symbols` picker on the print page.
+
+Both symbols compete for the same millimetres, so the layout is worked out per
+stock rather than fixed. On a label that is wide but short the barcode sits
+beside the QR so the QR keeps its full height; otherwise it runs full width
+underneath. The print page then reports what it actually produced — the QR's
+size and millimetres per module, and the barcode's bar width — because a label
+that is unreadable after you have cut it out is worth catching beforehand. A
+phone wants roughly 0.40 mm per QR module; a 1D laser wants 0.33 mm bars.
+
+The default, *Automatic*, will not buy a barcode at the price of an unreadable
+QR: on 1″ and 1″ × 2⅛″ stock it prints the QR alone (0.43–0.57 mm per module),
+and from 2¼″ upwards it prints both. Ask for both explicitly on small stock and
+you'll get them, with a warning saying how tight they are.
 
 In the print dialog: choose the LabelWriter, set the label size to the matching
 stock, margins to **none**, and scale to **100%** with "fit to page" off.
 Anything else shrinks the codes and can push them off the label.
+
+### Cutting labels off a paper sheet
+
+Sheet labels print with **cut and tape margins**: an 8 mm strip top and bottom
+marked *cut here · tape over this strip*, and 5 mm of clear space either side.
+They do two jobs — a cut that wanders by a few millimetres takes margin instead
+of taking the QR code, and packing tape has somewhere to land that isn't over a
+code. Cut along the outer line. The strips can be turned off from the print page
+if you'd rather fit more on a sheet.
+
+They are drawn with rules and text rather than shading, because browsers drop
+background graphics from printouts by default. Roll stock skips them: it's
+peel-and-stick, and the space is too precious.
 
 On the 1″ square stock the QR is 16 mm across, which scans fine from a phone —
 but the QR encodes the full URL, so a short base address (`http://192.168.1.24:8080`)
@@ -238,7 +258,7 @@ use it too.
 | `GET` | `/photos/{id}` | Photo bytes |
 | `GET` | `/api/export`, `/api/export.csv` | Backups |
 | `POST` | `/api/import?confirm=replace` | Restore |
-| `GET` | `/labels?codes=A,B&format=dymo-30332` | Printable labels (`format=custom&w=&h=` in mm) |
+| `GET` | `/labels?codes=A,B&format=dymo-30332` | Printable labels (`symbols=auto\|qr\|both\|barcode`, `tape=on\|off`, `format=custom&w=&h=` in mm) |
 | `GET` | `/b/{code}` | What a QR code resolves to |
 
 Deleting a container never deletes belongings: its items become unfiled and

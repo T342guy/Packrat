@@ -302,6 +302,8 @@ pub struct LabelParams {
     pub h: Option<f32>,
     /// `auto` (default), `qr`, `barcode` or `both`.
     pub symbols: Option<String>,
+    /// Cut-and-tape margins on paper sheets: `on` (default) or `off`.
+    pub tape: Option<String>,
 }
 
 pub fn escape_html(s: &str) -> String {
@@ -317,6 +319,98 @@ pub fn escape_html(s: &str) -> String {
         }
     }
     out
+}
+
+// Label geometry, in millimetres.
+const PAD_MM: f32 = 1.6;
+const GAP_MM: f32 = 1.6;
+const BAR_HEIGHT_MM: f32 = 6.5;
+/// Narrower bars than this and a 1D laser scanner starts failing.
+const MIN_BAR_MM: f32 = 0.33;
+/// Smaller QR modules than this and phone cameras start struggling.
+const MIN_QR_MODULE_MM: f32 = 0.40;
+/// Usable width of a portrait A4/Letter sheet inside its print margins.
+const SHEET_WIDTH_MM: f32 = 190.0;
+
+#[derive(PartialEq, Clone, Copy)]
+enum BarcodePlace {
+    /// Full width beneath the QR and text — the most bar width available.
+    Below,
+    /// Beside the QR, under the text: better when the label is wide and short,
+    /// because the QR keeps its full height.
+    Beside,
+}
+
+/// Worked-out sizes for one print job. Both symbols compete for the same
+/// millimetres, so this decides once and reports what it produced.
+struct Layout {
+    qr_mm: f32,
+    qr_module_mm: f32,
+    bar_mm: f32,
+    place: BarcodePlace,
+    max_items: usize,
+    show_location: bool,
+}
+
+fn plan_layout(
+    format: &LabelFormat,
+    want_qr: bool,
+    want_barcode: bool,
+    qr_modules: f32,
+    code_modules: f32,
+) -> Layout {
+    let (width, height) = match format.page_mm {
+        Some((w, h)) => (w, h),
+        // Sheet labels are laid out by the grid and have room to grow
+        // downwards, so only their width is constrained.
+        None => (SHEET_WIDTH_MM / format.columns as f32, f32::MAX),
+    };
+    let avail_w = width - 2.0 * PAD_MM;
+    let avail_h = if height == f32::MAX { f32::MAX } else { height - 2.0 * PAD_MM };
+
+    let mut place = BarcodePlace::Below;
+    let mut qr_mm = format.qr_mm.min(avail_h);
+
+    if want_barcode && want_qr && avail_h != f32::MAX {
+        let below_qr = (avail_h - BAR_HEIGHT_MM - GAP_MM).min(format.qr_mm);
+        let beside_qr = format.qr_mm.min(avail_h);
+        let beside_bar = (avail_w - beside_qr - GAP_MM) / code_modules;
+        // Only move the barcode alongside if it stays scannable there and the
+        // QR actually gains from it.
+        if beside_bar >= MIN_BAR_MM && beside_qr > below_qr {
+            place = BarcodePlace::Beside;
+            qr_mm = beside_qr;
+        } else {
+            qr_mm = below_qr;
+        }
+    }
+    qr_mm = qr_mm.max(8.0);
+
+    let bar_mm = if !want_barcode {
+        0.0
+    } else {
+        match place {
+            BarcodePlace::Beside => (avail_w - qr_mm - GAP_MM) / code_modules,
+            BarcodePlace::Below => avail_w / code_modules,
+        }
+    };
+
+    // What's left for text once the symbols have taken their share.
+    let text_height = match (want_barcode, place, avail_h) {
+        (_, _, h) if h == f32::MAX => f32::MAX,
+        (true, BarcodePlace::Below, h) => h - qr_mm.max(0.0) - BAR_HEIGHT_MM - GAP_MM,
+        (_, _, h) => h - 6.0,
+    };
+    let roomy = text_height == f32::MAX || text_height > 14.0;
+
+    Layout {
+        qr_mm,
+        qr_module_mm: if want_qr { qr_mm / qr_modules } else { 0.0 },
+        bar_mm,
+        place,
+        max_items: if roomy { format.max_items } else { 0 },
+        show_location: format.show_location && (roomy || !want_barcode),
+    }
 }
 
 /// The label stock the print page knows how to lay out.
@@ -335,7 +429,7 @@ pub async fn label_formats() -> Json<serde_json::Value> {
 
 /// Renders a printable sheet or roll of labels. Each label carries a QR code
 /// that opens that container's page, plus — where the label is big enough — a
-/// preview of what's inside, so it stays useful to someone without a phone.
+/// barcode for laser scanners and a preview of what's inside.
 pub async fn print_labels(
     State(st): State<AppState>,
     Query(params): Query<LabelParams>,
@@ -354,70 +448,80 @@ pub async fn print_labels(
         }
         None => find_format("sheet-large").unwrap(),
     };
+    let on_paper = format.page_mm.is_none();
 
     let wanted: Option<Vec<String>> = params.codes.as_ref().filter(|_| !params.all).map(|c| {
         c.split(',').map(store::normalize_code).filter(|s| !s.is_empty()).collect()
     });
 
-    // A Code 128 symbol needs roughly half a millimetre per module to survive a
-    // cheap laser scanner; below that width the barcode is printed but likely
-    // unreadable, so `auto` leaves it off.
-    let label_width = format.page_mm.map(|(w, _)| w).unwrap_or(90.0);
+    let label_width = format.page_mm.map(|(w, _)| w).unwrap_or(SHEET_WIDTH_MM / format.columns as f32);
     let symbols = params.symbols.as_deref().unwrap_or("auto");
     let want_qr = matches!(symbols, "auto" | "qr" | "both");
-    let want_barcode = match symbols {
+    let mut want_barcode = match symbols {
         "barcode" | "both" => true,
         "auto" => label_width >= 48.0,
         _ => false,
     };
+    // Cut-and-tape margins only make sense on paper you cut up yourself.
+    let tape = on_paper && params.tape.as_deref() != Some("off");
 
-    // A barcode block (bars plus its caption) is about 11 mm tall. On fixed
-    // height stock that space has to come from somewhere: shrink the QR, and
-    // list fewer items, rather than letting content spill off the label.
-    const BARCODE_BLOCK_MM: f32 = 11.0;
-    let label_height = format.page_mm.map(|(_, h)| h);
-    let qr_mm = match (want_barcode, label_height) {
-        (true, Some(h)) => (h - 3.2 - BARCODE_BLOCK_MM - 1.0).clamp(12.0, format.qr_mm),
-        _ => format.qr_mm,
-    };
-    // Below 40 mm of height the barcode leaves no room for a contents list;
-    // half a clipped line looks broken, so drop the list rather than crop it.
-    let max_items = match (want_barcode, label_height) {
-        (true, Some(h)) if h < 40.0 => 0,
-        _ => format.max_items,
-    };
-    // Same reasoning for the parent location: on a crowded label the code and
-    // the name are what matter.
-    let show_location = format.show_location
-        && !matches!((want_barcode, label_height), (true, Some(h)) if h < 40.0);
-    let containers = db::run(&st.pool, {
+    let all_containers = db::run(&st.pool, {
         let wanted = wanted.clone();
         move |c| {
             let all = store::all_containers(c)?;
-            let selected: Vec<_> = match &wanted {
+            Ok(match &wanted {
                 Some(codes) if !codes.is_empty() => {
                     all.into_iter().filter(|x| codes.contains(&x.code.to_uppercase())).collect()
                 }
                 _ => all,
-            };
-            let mut out = Vec::new();
-            for container in selected {
-                let items = if max_items > 0 {
-                    store::query_items(
-                        c,
-                        &store::ItemQuery {
-                            container_id: Some(container.id),
-                            limit: Some(max_items as i64),
-                            ..Default::default()
-                        },
-                    )?
-                } else {
-                    Vec::new()
-                };
-                out.push((container, items));
-            }
-            Ok(out)
+            })
         }
+    })
+    .await?;
+
+    // Size the symbols from the actual data: a longer code needs more modules,
+    // and every module has to fit inside the label.
+    let qr_modules = all_containers
+        .iter()
+        .filter_map(|c| QrCode::new(format!("{}/b/{}", base, c.code).as_bytes()).ok())
+        .map(|q| q.width() as f32 + 8.0)
+        .fold(29.0_f32, f32::max);
+    let code_modules = all_containers
+        .iter()
+        .filter_map(|c| crate::barcode::code128_modules(&scannable_code(c)).ok())
+        .fold(132u32, u32::max) as f32;
+
+    let mut layout = plan_layout(format, want_qr, want_barcode, qr_modules, code_modules);
+    // Both symbols compete for the same millimetres. Left to itself, `auto`
+    // would happily fit a barcode by squeezing the QR past the point a phone
+    // can read it — so if that is the trade on this stock, keep the QR.
+    if symbols == "auto"
+        && want_barcode
+        && (layout.qr_module_mm < MIN_QR_MODULE_MM || layout.bar_mm < MIN_BAR_MM)
+    {
+        want_barcode = false;
+        layout = plan_layout(format, want_qr, want_barcode, qr_modules, code_modules);
+    }
+
+    let max_items = layout.max_items as i64;
+    let containers = db::run(&st.pool, move |c| {
+        let mut out = Vec::new();
+        for container in all_containers {
+            let items = if max_items > 0 {
+                store::query_items(
+                    c,
+                    &store::ItemQuery {
+                        container_id: Some(container.id),
+                        limit: Some(max_items),
+                        ..Default::default()
+                    },
+                )?
+            } else {
+                Vec::new()
+            };
+            out.push((container, items));
+        }
+        Ok(out)
     })
     .await?;
 
@@ -425,47 +529,40 @@ pub async fn print_labels(
         return Ok(Html(page_shell(
             "No labels",
             format,
-            format.qr_mm,
+            &layout,
+            tape,
             "<p class=\"empty\">No containers matched. Add a box first, then print its label.</p>"
                 .into(),
         )));
     }
 
     let mut body = String::new();
-    // Report the narrowest bar this print will actually produce, so the choice
-    // of label stock can be judged rather than guessed at.
-    let widest_code = containers
-        .iter()
-        .filter_map(|(c, _)| crate::barcode::code128_modules(&scannable_code(c)).ok())
-        .max()
-        .unwrap_or(132);
-    let module_mm = (label_width - 3.2) / widest_code as f32;
-    body.push_str(&toolbar(format, symbols, want_barcode, module_mm));
-    body.push_str(&format!(
-        "<div class=\"sheet {}\">",
-        if format.page_mm.is_some() { "roll" } else { "paper" }
-    ));
+    body.push_str(&toolbar(format, symbols, want_qr, want_barcode, &layout, on_paper, tape));
+    body.push_str(&format!("<div class=\"sheet {}\">", if on_paper { "paper" } else { "roll" }));
 
     for (container, items) in &containers {
         let url = format!("{}/b/{}", base, container.code);
         let qr = if want_qr {
-            format!("<div class=\"qr\">{}</div>", qr_svg(&url, (qr_mm * 8.0) as u32)?)
+            format!(
+                "<div class=\"qr\" data-modules=\"{:.0}\" data-mm=\"{:.1}\">{}</div>",
+                qr_modules,
+                layout.qr_mm,
+                qr_svg(&url, (layout.qr_mm * 8.0) as u32)?
+            )
         } else {
             String::new()
         };
+        // No caption under the bars: the code is already printed beside them.
         let barcode = if want_barcode {
             match crate::barcode::code128_svg(&scannable_code(container), 26) {
-                Ok(svg) => format!(
-                    "<div class=\"barcode\">{svg}<span>{}</span></div>",
-                    escape_html(&scannable_code(container))
-                ),
+                Ok(svg) => format!("<div class=\"barcode\">{svg}</div>"),
                 Err(_) => String::new(),
             }
         } else {
             String::new()
         };
 
-        let contents = if format.show_contents && !items.is_empty() {
+        let contents = if layout.max_items > 0 && !items.is_empty() {
             let lis: String = items
                 .iter()
                 .map(|i| {
@@ -490,7 +587,7 @@ pub async fn print_labels(
             String::new()
         };
 
-        let location = if show_location && container.path.contains(" / ") {
+        let location = if layout.show_location && container.path.contains(" / ") {
             let parent = container
                 .path
                 .rsplit_once(" / ")
@@ -506,8 +603,21 @@ pub async fn print_labels(
             String::new()
         };
 
+        let beside = layout.place == BarcodePlace::Beside;
+        let tape_top = if tape {
+            "<div class=\"tape-zone top\">cut here · tape over this strip</div>"
+        } else {
+            ""
+        };
+        let tape_bottom = if tape {
+            "<div class=\"tape-zone bottom\">cut here · tape over this strip</div>"
+        } else {
+            ""
+        };
+
         body.push_str(&format!(
-            r#"<div class="label{stacked}{barcode_only}">
+            r#"<div class="label{stacked}{barcode_only}{taped}">
+                 {tape_top}
                  <div class="label-main">
                    {qr}
                    <div class="meta">
@@ -515,25 +625,40 @@ pub async fn print_labels(
                      {name}
                      {location}
                      {contents}
+                     {meta_barcode}
                    </div>
                  </div>
-                 {barcode}
+                 {below_barcode}
+                 {tape_bottom}
                </div>"#,
             stacked = if format.stacked { " stacked" } else { "" },
             barcode_only = if want_barcode && !want_qr { " barcode-only" } else { "" },
+            taped = if tape { " taped" } else { "" },
+            tape_top = tape_top,
             qr = qr,
             code = escape_html(&container.code),
             name = name,
             location = location,
             contents = contents,
-            barcode = barcode,
+            meta_barcode = if beside { barcode.as_str() } else { "" },
+            below_barcode = if beside { "" } else { barcode.as_str() },
+            tape_bottom = tape_bottom,
         ));
     }
     body.push_str("</div>");
-    Ok(Html(page_shell("Labels", format, qr_mm, body)))
+    Ok(Html(page_shell("Labels", format, &layout, tape, body)))
 }
 
-fn toolbar(format: &LabelFormat, symbols: &str, want_barcode: bool, module_mm: f32) -> String {
+#[allow(clippy::too_many_arguments)]
+fn toolbar(
+    format: &LabelFormat,
+    symbols: &str,
+    want_qr: bool,
+    want_barcode: bool,
+    layout: &Layout,
+    on_paper: bool,
+    tape: bool,
+) -> String {
     let options: String = LABEL_FORMATS
         .iter()
         .map(|f| {
@@ -545,18 +670,6 @@ fn toolbar(format: &LabelFormat, symbols: &str, want_barcode: bool, module_mm: f
             )
         })
         .collect();
-    let roll_help = if let Some((w, h)) = format.page_mm {
-        format!(
-            "<p class=\"help\">Printing to a label printer: pick the LabelWriter in the print \
-             dialog, set the label size to <strong>{}</strong> ({w} × {h} mm), margins to none \
-             and scale to 100% — turn off “fit to page”. One label prints per page.</p>",
-            escape_html(format.name)
-        )
-    } else {
-        "<p class=\"help\">Print at 100% scale on ordinary paper, then tape or glue one label \
-         per box.</p>"
-            .to_string()
-    };
     let symbol_options: String = [
         ("auto", "Automatic"),
         ("qr", "QR code only"),
@@ -571,20 +684,65 @@ fn toolbar(format: &LabelFormat, symbols: &str, want_barcode: bool, module_mm: f
         )
     })
     .collect();
-    let barcode_warning = if want_barcode && module_mm < 0.3 {
+
+    // Say plainly what this print will produce, rather than leaving the user to
+    // discover an unscannable label after cutting it out.
+    let mut notes = String::new();
+    if want_qr {
+        let class = if layout.qr_module_mm < MIN_QR_MODULE_MM { "help warn" } else { "help" };
+        let verdict = if layout.qr_module_mm < MIN_QR_MODULE_MM {
+            " — that is tight for a phone camera. Use larger stock, or print the barcode only \
+             and scan it with a laser scanner."
+        } else {
+            " — comfortable for a phone camera."
+        };
+        notes.push_str(&format!(
+            "<p class=\"{class}\">QR code prints {:.0} mm across, {:.2} mm per module{verdict}</p>",
+            layout.qr_mm, layout.qr_module_mm
+        ));
+    }
+    if want_barcode {
+        let class = if layout.bar_mm < MIN_BAR_MM { "help warn" } else { "help" };
+        let verdict = if layout.bar_mm < MIN_BAR_MM {
+            " — too fine for most laser scanners, which want 0.33 mm or more. Use wider stock."
+        } else {
+            " — any 1D laser scanner should read it."
+        };
+        notes.push_str(&format!(
+            "<p class=\"{class}\">Barcode bars print at {:.2} mm{verdict}</p>",
+            layout.bar_mm
+        ));
+    }
+
+    let stock_help = match format.page_mm {
+        Some((w, h)) => format!(
+            "<p class=\"help\">Printing to a label printer: pick the LabelWriter in the print \
+             dialog, set the label size to <strong>{}</strong> ({w} × {h} mm), margins to none \
+             and scale to 100% — turn off “fit to page”. One label prints per page.</p>",
+            escape_html(format.name)
+        ),
+        None => format!(
+            "<p class=\"help\">Print at 100% scale on ordinary paper.{}</p>",
+            if tape {
+                " Cut along the outer line — the marked strips top and bottom are spare margin, \
+                 so a slightly wonky cut costs you nothing, and packing tape can go over them \
+                 without covering the codes."
+            } else {
+                " Cut carefully: without margins there is nothing between the outline and the \
+                 printing."
+            }
+        ),
+    };
+
+    let tape_toggle = if on_paper {
         format!(
-            "<p class=\"help warn\">⚠ On this label the barcode's narrowest bar works out at \
-             {module_mm:.2} mm. Laser scanners generally need 0.3 mm or more — use wider label \
-             stock, or print QR only and pair it with a 2D imaging scanner.</p>"
-        )
-    } else if want_barcode {
-        format!(
-            "<p class=\"help\">Barcode bars print at {module_mm:.2} mm wide here, which any \
-             1D laser scanner should read.</p>"
+            "<label class=\"pick\"><input type=\"checkbox\" id=\"tape\"{}> Cut &amp; tape margins</label>",
+            if tape { " checked" } else { "" }
         )
     } else {
         String::new()
     };
+
     format!(
         r#"<div class="toolbar no-print">
              <button onclick="window.print()">Print</button>
@@ -594,41 +752,68 @@ fn toolbar(format: &LabelFormat, symbols: &str, want_barcode: bool, module_mm: f
              <label class="pick">Symbols
                <select id="symbols">{symbol_options}</select>
              </label>
+             {tape_toggle}
              <a href="/#/labels">Back to the app</a>
            </div>
-           {barcode_warning}
-           {roll_help}
+           {notes}
+           {stock_help}
            <script>
-             document.getElementById('format').addEventListener('change', (e) => {{
+             const reload = (changes) => {{
                const params = new URLSearchParams(location.search);
+               for (const [key, value] of Object.entries(changes)) {{
+                 if (value === null) params.delete(key);
+                 else params.set(key, value);
+               }}
+               params.delete('size');
+               location.search = params.toString();
+             }};
+             document.getElementById('format').addEventListener('change', (e) => {{
+               const changes = {{ format: e.target.value }};
                if (e.target.value === 'custom') {{
                  const size = prompt('Label size in millimetres, width × height', '25 x 25');
                  if (!size) return;
                  const [w, h] = size.split(/[x×,]/).map((n) => parseFloat(n.trim()));
                  if (!w || !h) return;
-                 params.set('w', w); params.set('h', h);
+                 changes.w = w;
+                 changes.h = h;
                }}
-               params.set('format', e.target.value);
-               params.delete('size');
-               location.search = params.toString();
+               reload(changes);
              }});
+             document.getElementById('symbols').addEventListener('change', (e) => {{
+               reload({{ symbols: e.target.value }});
+             }});
+             const tapeBox = document.getElementById('tape');
+             if (tapeBox) {{
+               tapeBox.addEventListener('change', (e) => {{
+                 reload({{ tape: e.target.checked ? 'on' : 'off' }});
+               }});
+             }}
            </script>"#,
         options = options,
         custom = if format.id == "custom" { " selected" } else { "" },
-        roll_help = roll_help,
+        symbol_options = symbol_options,
+        tape_toggle = tape_toggle,
+        notes = notes,
+        stock_help = stock_help,
     )
 }
 
-fn page_shell(title: &str, format: &LabelFormat, qr_mm: f32, body: String) -> String {
-    // Roll stock prints one label per page at the exact label size; sheet
-    // stock tiles labels onto whatever paper the printer holds.
+fn page_shell(
+    title: &str,
+    format: &LabelFormat,
+    layout: &Layout,
+    tape: bool,
+    body: String,
+) -> String {
+    // Roll stock prints one label per page at the exact label size; sheet stock
+    // tiles labels onto whatever paper the printer holds.
     let (page_rule, label_rule, sheet_rule) = match format.page_mm {
         Some((w, h)) => (
             format!("@page {{ size: {w}mm {h}mm; margin: 0; }}"),
             format!(
-                ".label {{ width: {w}mm; height: {h}mm; padding: 1.6mm; gap: 1.2mm;
+                ".label {{ width: {w}mm; height: {h}mm; padding: {PAD_MM}mm; gap: {GAP_MM}mm;
                           border-radius: 0; overflow: hidden; }}
-                 .label-main {{ gap: 1.6mm; }}
+                 .label-main {{ gap: {GAP_MM}mm; }}
                  @media print {{ .label {{ break-after: page; page-break-after: always;
                                           border: 0; }} }}"
             ),
@@ -637,11 +822,19 @@ fn page_shell(title: &str, format: &LabelFormat, qr_mm: f32, body: String) -> St
         ),
         None => (
             "@page { margin: 10mm; }".to_string(),
-            ".label { padding: 12px; gap: 12px; }".to_string(),
+            format!(
+                ".label {{ padding: {}; gap: 3mm; }}
+                 .label-main {{ gap: 3mm; padding: {}; }}",
+                if tape { "0" } else { "3mm" },
+                // Side margin gives a crooked vertical cut the same slack the
+                // tape strips give a horizontal one.
+                if tape { "0 5mm" } else { "0" }
+            ),
             format!(".sheet.paper {{ grid-template-columns: repeat({}, 1fr); }}", format.columns),
         ),
     };
-    let qr = qr_mm;
+    let qr = layout.qr_mm;
+    let bar_height = BAR_HEIGHT_MM;
     format!(
         r#"<!doctype html>
 <html lang="en"><head>
@@ -659,22 +852,23 @@ fn page_shell(title: &str, format: &LabelFormat, qr_mm: f32, body: String) -> St
   .toolbar .pick {{ display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; }}
   .toolbar select {{ font: inherit; font-size: 14px; padding: 6px 8px; border-radius: 8px;
                      border: 1px solid #ccc; background: #fff; color: #111; }}
-  .help {{ color: #555; font-size: 13px; max-width: 70ch; margin: 0 0 18px; }}
+  .help {{ color: #555; font-size: 13px; max-width: 70ch; margin: 0 0 6px; }}
+  .help.warn {{ color: #8a5300; font-weight: 600; }}
   .empty {{ color: #666; }}
-  .sheet {{ display: grid; gap: 10px; }}
+  .sheet {{ display: grid; gap: 10px; margin-top: 12px; }}
   {sheet_rule}
   .label {{ display: flex; flex-direction: column; border: 1px dashed #bbb; border-radius: 8px;
             background: #fff; break-inside: avoid; page-break-inside: avoid; }}
-  /* The barcode sits under the QR/text row so it can use the label's full
-     width — bars any narrower than about 0.3 mm stop scanning reliably. */
-  .label-main {{ display: flex; align-items: flex-start; gap: inherit; flex: 1 1 auto;
+  /* The barcode goes full width under everything else unless the label is wide
+     and short, where sitting beside the QR leaves the QR its full height. */
+  .label-main {{ display: flex; align-items: flex-start; flex: 1 1 auto;
                  min-height: 0; width: 100%; overflow: hidden; }}
   .label.stacked .label-main {{ flex-direction: column; align-items: center; text-align: center; }}
   {label_rule}
   {page_rule}
   .label .qr {{ flex: 0 0 auto; }}
   .label .qr svg {{ display: block; width: {qr}mm; height: {qr}mm; }}
-  .meta {{ min-width: 0; overflow: hidden; }}
+  .meta {{ min-width: 0; overflow: hidden; flex: 1 1 auto; }}
   .label.stacked .meta {{ width: 100%; }}
   .code {{ font: 700 9pt ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .4px;
            white-space: nowrap; }}
@@ -691,15 +885,22 @@ fn page_shell(title: &str, format: &LabelFormat, qr_mm: f32, body: String) -> St
   .contents .qty {{ color: #555; }}
   .contents .more {{ color: #777; font-style: italic; list-style: none; margin-left: -4mm; }}
   .barcode {{ margin-top: 1.2mm; width: 100%; }}
-  .barcode svg {{ display: block; width: 100%; height: 7mm; }}
+  .barcode svg {{ display: block; width: 100%; height: {bar_height}mm; }}
   .label.barcode-only .barcode svg {{ height: 12mm; }}
-  .barcode span {{ display: block; font: 700 7pt ui-monospace, SFMono-Regular, Menlo, monospace;
-                   letter-spacing: .5px; text-align: center; }}
-  .help.warn {{ color: #8a5300; }}
+  /* Spare margin at the top and bottom of a paper label: room for a wonky cut,
+     and somewhere to run tape without covering a code. Drawn with borders and
+     text only, because browsers drop background graphics when printing. */
+  .tape-zone {{ flex: 0 0 auto; height: 8mm; display: flex; align-items: center;
+                justify-content: center; font-size: 6pt; letter-spacing: .14em;
+                text-transform: uppercase; color: #aaa; }}
+  .tape-zone.top {{ border-bottom: 1px dotted #ddd; }}
+  .tape-zone.bottom {{ border-top: 1px dotted #ddd; }}
+  .label.taped {{ border-style: solid; border-color: #999; }}
   @media print {{
     body {{ background: #fff; padding: 0; }}
     .no-print, .help {{ display: none !important; }}
-    .sheet {{ gap: 0; }}
+    .sheet {{ gap: 0; margin-top: 0; }}
+    .tape-zone {{ color: #bbb; }}
   }}
 </style>
 </head><body>{body}</body></html>"#
