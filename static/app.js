@@ -71,6 +71,7 @@ const state = {
   tags: [],
   stats: {},
   kinds: [],
+  containerOnlyKinds: [],
   publicUrl: '',
   clock: null,
   about: null,
@@ -82,6 +83,7 @@ async function refreshState() {
   state.tags = data.tags;
   state.stats = data.stats;
   state.kinds = data.kinds;
+  state.containerOnlyKinds = data.container_only_kinds || [];
   state.publicUrl = data.public_url;
   state.clock = data.clock;
   state.about = {
@@ -94,6 +96,9 @@ async function refreshState() {
 }
 
 const containerById = (id) => state.containers.find((c) => c.id === Number(id));
+
+/** Areas are places that hold boxes and shelves, not loose items. */
+const holdsItems = (kind) => !state.containerOnlyKinds.includes(kind);
 
 const KIND_LABEL = {
   area: 'Area', shelf: 'Shelf', cabinet: 'Cabinet', drawer: 'Drawer',
@@ -163,7 +168,9 @@ function childBox(child) {
   const body = child.items.length
     ? `<div class="list">${child.items.map((i) => itemRow(i, { hideLocation: true })).join('')}</div>`
     : `<div class="empty" style="padding:14px">Nothing listed in here yet.
-         <button class="tiny" data-act="add-item" data-container="${child.id}">Add an item</button>
+         ${holdsItems(child.kind)
+           ? `<button class="tiny" data-act="add-item" data-container="${child.id}">Add an item</button>`
+           : `<button class="tiny" data-act="add-box" data-parent="${child.id}">Add a box or shelf</button>`}
        </div>`;
   return `
     <details class="card childbox">
@@ -177,7 +184,10 @@ function childBox(child) {
       <div class="childbox-actions">
         <a class="btn tiny" href="#/box/${encodeURIComponent(child.code)}">Open</a>
         <button class="tiny" data-act="edit-box" data-id="${child.id}">Rename / edit</button>
-        <button class="tiny" data-act="add-item" data-container="${child.id}">+ Item</button>
+        ${holdsItems(child.kind)
+          ? `<button class="tiny" data-act="add-item" data-container="${child.id}">+ Item</button>`
+          : ''}
+        <button class="tiny" data-act="add-box" data-parent="${child.id}">+ Inside</button>
         ${child.items.length
           ? `<a class="btn tiny" href="#/verify/${encodeURIComponent(child.code)}">Check contents</a>`
           : ''}
@@ -186,7 +196,7 @@ function childBox(child) {
     </details>`;
 }
 
-function containerOptions(selectedId, excludeId) {
+function containerOptions(selectedId, excludeId, options = {}) {
   const excluded = new Set();
   if (excludeId) {
     // Prevent picking a container that lives inside the one being edited.
@@ -198,6 +208,7 @@ function containerOptions(selectedId, excludeId) {
   }
   return state.containers
     .filter((c) => !excluded.has(c.id))
+    .filter((c) => !options.forItems || holdsItems(c.kind))
     .map((c) => {
       const indent = '  '.repeat(c.depth);
       const selected = Number(selectedId) === c.id ? ' selected' : '';
@@ -312,6 +323,7 @@ async function viewBox(key) {
     : `/api/by-code/${encodeURIComponent(key)}`;
   const detail = await api(path);
   const c = detail.container;
+  const canHoldItems = holdsItems(c.kind);
   const crumbs = detail.ancestors
     .map((a) => `<a href="#/box/${encodeURIComponent(a.code)}">${esc(a.name)}</a>`)
     .concat([esc(c.name)])
@@ -338,10 +350,13 @@ async function viewBox(key) {
             ${c.item_count ? `<a href="#/verify/${encodeURIComponent(c.code)}">Check contents</a>` : ''}
           </div>
           <div class="actions" style="margin-top:12px">
-            <button class="primary" data-act="add-item" data-container="${c.id}">+ Add item here</button>
+            ${canHoldItems
+              ? `<button class="primary" data-act="add-item" data-container="${c.id}">+ Add item here</button>`
+              : ''}
+            <button class="${canHoldItems ? '' : 'primary'}" data-act="add-box"
+                    data-parent="${c.id}">+ Add a box or shelf inside</button>
             <button data-act="edit-box" data-id="${c.id}">Rename / edit</button>
-            <a class="btn" href="/labels?codes=${encodeURIComponent(c.code)}" target="_blank"
-               rel="noopener">Print label</a>
+            <a class="btn" href="#/labels?codes=${encodeURIComponent(c.code)}">Print label</a>
           </div>
         </div>
         <div class="qr">
@@ -354,12 +369,21 @@ async function viewBox(key) {
     ${detail.children.length
       ? `<h2>Inside this ${esc((KIND_LABEL[c.kind] || 'container').toLowerCase())}</h2>
          ${detail.children.map(childBox).join('')}`
-      : ''}
+      : !canHoldItems
+        ? `<div class="card"><div class="empty">
+             <strong>Nothing in here yet</strong>
+             An area holds boxes and shelves — add the first one.
+             <div style="margin-top:10px"><button class="tiny primary" data-act="add-box"
+               data-parent="${c.id}">Add a box or shelf</button></div>
+           </div></div>`
+        : ''}
 
-    <h2>Contents</h2>
-    ${itemList(detail.items, `This ${esc((KIND_LABEL[c.kind] || 'container').toLowerCase())} is empty.
-       <div style="margin-top:10px"><button class="tiny primary" data-act="add-item"
-         data-container="${c.id}">Add the first item</button></div>`, { hideLocation: true })}`;
+    ${canHoldItems || detail.items.length
+      ? `<h2>Contents</h2>
+         ${itemList(detail.items, `This ${esc((KIND_LABEL[c.kind] || 'container').toLowerCase())} is empty.
+            <div style="margin-top:10px"><button class="tiny primary" data-act="add-item"
+              data-container="${c.id}">Add the first item</button></div>`, { hideLocation: true })}`
+      : ''}`;
 }
 
 /** The queue of containers whose contents haven't been confirmed in a while. */
@@ -507,6 +531,8 @@ async function viewBoxes() {
           </a>
           <span class="kind">${esc(KIND_LABEL[c.kind] || '')}${
             counts.length ? ` · ${counts.join(' · ')}` : ''}</span>
+          <button class="tiny" data-act="add-box" data-parent="${c.id}"
+                  title="Add a box or shelf inside ${esc(c.name)}">+ Inside</button>
           <button class="tiny" data-act="edit-box" data-id="${c.id}"
                   title="Rename or move ${esc(c.name)}">Rename</button>
         </div>`;
@@ -971,7 +997,7 @@ function itemModal(item, defaults = {}) {
         <label class="field">Where is it?
           <select name="container_id">
             <option value="">Not in a box yet</option>
-            ${containerOptions(data.container_id)}
+            ${containerOptions(data.container_id, null, { forItems: true })}
           </select>
         </label>
       </div>
