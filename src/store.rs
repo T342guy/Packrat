@@ -393,19 +393,30 @@ pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail
     ancestors.reverse();
 
     // Each child is returned with its own contents so a shelf can show every
-    // box on it with a collapsed list of what's inside.
-    let mut children: Vec<ChildNode> = Vec::new();
-    for child in all.iter().filter(|c| c.parent_id == Some(id)) {
-        let items =
-            query_items(conn, &ItemQuery { container_id: Some(child.id), ..Default::default() })?;
-        children.push(ChildNode {
-            child_count: child.child_count,
-            container: child.clone(),
-            items,
-        });
-    }
+    // box on it with a collapsed list of what's inside. One query covers this
+    // container and all of its children: querying per child re-scanned the tag
+    // table and rebuilt the container tree once per box.
+    let child_list: Vec<&Container> = all.iter().filter(|c| c.parent_id == Some(id)).collect();
+    let mut wanted: Vec<i64> = vec![id];
+    wanted.extend(child_list.iter().map(|c| c.id));
+    let loaded = query_items(conn, &ItemQuery { container_ids: Some(wanted), ..Default::default() })?;
 
-    let items = query_items(conn, &ItemQuery { container_id: Some(id), ..Default::default() })?;
+    let mut by_container: HashMap<i64, Vec<Item>> = HashMap::new();
+    for item in loaded {
+        if let Some(cid) = item.container_id {
+            by_container.entry(cid).or_default().push(item);
+        }
+    }
+    let children: Vec<ChildNode> = child_list
+        .iter()
+        .map(|child| ChildNode {
+            child_count: child.child_count,
+            container: (*child).clone(),
+            items: by_container.remove(&child.id).unwrap_or_default(),
+        })
+        .collect();
+
+    let items = by_container.remove(&id).unwrap_or_default();
 
     let nested = descendant_ids(&all, id);
     let (nested_item_count, nested_total_quantity) = all
@@ -429,6 +440,9 @@ pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail
 pub struct ItemQuery {
     pub q: Option<String>,
     pub container_id: Option<i64>,
+    /// Fetch the contents of several containers at once, so a shelf can load
+    /// every box on it in one query instead of one query per box.
+    pub container_ids: Option<Vec<i64>>,
     pub include_nested: bool,
     pub tag: Option<String>,
     pub unfiled: bool,
@@ -460,6 +474,16 @@ pub fn query_items(conn: &Connection, query: &ItemQuery) -> AppResult<Vec<Item>>
     );
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+    if let Some(ids) = &query.container_ids {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(" AND i.container_id IN ({placeholders})"));
+        for id in ids {
+            binds.push(Box::new(*id));
+        }
+    }
     if let Some(cid) = query.container_id {
         if query.include_nested {
             let all = all_containers(conn)?;
