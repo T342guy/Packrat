@@ -108,7 +108,11 @@ mod tests {
         for (value, pattern) in PATTERNS.iter().enumerate() {
             let sum: u32 = pattern.chars().map(|c| c.to_digit(10).unwrap()).sum();
             assert_eq!(sum, 11, "pattern {value} ({pattern}) is not 11 modules");
-            assert_eq!(pattern.len(), 6, "pattern {value} does not have six elements");
+            assert_eq!(
+                pattern.len(),
+                6,
+                "pattern {value} does not have six elements"
+            );
         }
     }
 
@@ -122,7 +126,11 @@ mod tests {
                 .step_by(2)
                 .map(|c| c.to_digit(10).unwrap())
                 .sum();
-            assert_eq!(bars % 2, 0, "pattern {value} ({pattern}) has odd bar parity");
+            assert_eq!(
+                bars % 2,
+                0,
+                "pattern {value} ({pattern}) has odd bar parity"
+            );
         }
     }
 
@@ -130,7 +138,10 @@ mod tests {
     fn decode(widths: &[u32]) -> Result<String, String> {
         // The trailing stop pattern is seven elements, not six; drop it first
         // so the rest divides evenly into symbols.
-        let stop: String = widths[widths.len() - 7..].iter().map(|w| w.to_string()).collect();
+        let stop: String = widths[widths.len() - 7..]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
         if stop != STOP {
             return Err(format!("symbol does not end with a stop pattern: {stop}"));
         }
@@ -193,6 +204,9 @@ mod tests {
         let svg = code128_svg("BX-7K3Q", 30).unwrap();
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("viewBox=\"0 0 "));
-        assert!(svg.contains("<rect x=\"10\""), "first bar sits after the quiet zone");
+        assert!(
+            svg.contains("<rect x=\"10\""),
+            "first bar sits after the quiet zone"
+        );
     }
 }

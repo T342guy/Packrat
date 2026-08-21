@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+*.db
+*.db-wal
+*.db-shm
+Dockerfile
+docker-compose.yml
+README.md
+scripts/

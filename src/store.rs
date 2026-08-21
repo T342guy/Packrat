@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ";
 const MAX_DEPTH: usize = 64;
 
-pub const KINDS: &[&str] = &["area", "shelf", "cabinet", "drawer", "bin", "box", "bag", "other"];
+pub const KINDS: &[&str] = &[
+    "area", "shelf", "cabinet", "drawer", "bin", "box", "bag", "other",
+];
 
 /// How long a container's contents are trusted before the app suggests
 /// re-checking them. Overridable in Settings.
@@ -73,7 +75,10 @@ fn generate_code(conn: &Connection, kind: &str) -> AppResult<String> {
 
 /// Barcodes are stored trimmed; blank means "none".
 pub fn normalize_barcode(barcode: Option<&str>) -> Option<String> {
-    barcode.map(str::trim).filter(|b| !b.is_empty()).map(|b| b.to_string())
+    barcode
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(|b| b.to_string())
 }
 
 /// Refuses a barcode already used elsewhere, so one scan means one thing.
@@ -87,8 +92,9 @@ fn check_barcode_free(
     let sql = format!(
         "SELECT name FROM {table} WHERE barcode = ?1 COLLATE NOCASE AND id IS NOT ?2 LIMIT 1"
     );
-    let clash: Option<String> =
-        conn.query_row(&sql, params![value, exclude_id], |r| r.get(0)).optional()?;
+    let clash: Option<String> = conn
+        .query_row(&sql, params![value, exclude_id], |r| r.get(0))
+        .optional()?;
     match clash {
         Some(name) => Err(AppError::bad_request(format!(
             "barcode {value} is already assigned to {name}"
@@ -159,7 +165,11 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
              FROM items WHERE container_id IS NOT NULL GROUP BY container_id",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         for row in rows {
             let (cid, count, qty) = row?;
@@ -258,7 +268,9 @@ pub fn descendant_ids(all: &[Container], root: i64) -> Vec<i64> {
 }
 
 fn validate_parent(all: &[Container], id: Option<i64>, parent_id: Option<i64>) -> AppResult<()> {
-    let Some(parent) = parent_id else { return Ok(()) };
+    let Some(parent) = parent_id else {
+        return Ok(());
+    };
     if !all.iter().any(|c| c.id == parent) {
         return Err(AppError::bad_request("parent container does not exist"));
     }
@@ -287,7 +299,9 @@ pub fn create_container(conn: &Connection, input: &ContainerInput) -> AppResult<
     let code = match input.code.as_deref().map(normalize_code) {
         Some(c) if !c.is_empty() => {
             if all.iter().any(|x| x.code.to_uppercase() == c) {
-                return Err(AppError::bad_request(format!("label code {c} is already in use")));
+                return Err(AppError::bad_request(format!(
+                    "label code {c} is already in use"
+                )));
             }
             c
         }
@@ -299,12 +313,24 @@ pub fn create_container(conn: &Connection, input: &ContainerInput) -> AppResult<
     conn.execute(
         "INSERT INTO containers (code, name, kind, parent_id, notes, photo_id, barcode)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![code, name, kind, input.parent_id, input.notes.trim(), input.photo_id, barcode],
+        params![
+            code,
+            name,
+            kind,
+            input.parent_id,
+            input.notes.trim(),
+            input.photo_id,
+            barcode
+        ],
     )?;
     container_by_id(conn, conn.last_insert_rowid())
 }
 
-pub fn update_container(conn: &Connection, id: i64, input: &ContainerInput) -> AppResult<Container> {
+pub fn update_container(
+    conn: &Connection,
+    id: i64,
+    input: &ContainerInput,
+) -> AppResult<Container> {
     let name = input.name.trim();
     if name.is_empty() {
         return Err(AppError::bad_request("name is required"));
@@ -319,11 +345,17 @@ pub fn update_container(conn: &Connection, id: i64, input: &ContainerInput) -> A
     let code = match input.code.as_deref().map(normalize_code) {
         Some(c) if !c.is_empty() => {
             if all.iter().any(|x| x.id != id && x.code.to_uppercase() == c) {
-                return Err(AppError::bad_request(format!("label code {c} is already in use")));
+                return Err(AppError::bad_request(format!(
+                    "label code {c} is already in use"
+                )));
             }
             c
         }
-        _ => all.iter().find(|c| c.id == id).map(|c| c.code.clone()).unwrap_or_default(),
+        _ => all
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.code.clone())
+            .unwrap_or_default(),
     };
 
     let barcode = normalize_barcode(input.barcode.as_deref());
@@ -334,7 +366,14 @@ pub fn update_container(conn: &Connection, id: i64, input: &ContainerInput) -> A
                 barcode = ?7, updated_at = datetime('now')
           WHERE id = ?8",
         params![
-            code, name, kind, input.parent_id, input.notes.trim(), input.photo_id, barcode, id
+            code,
+            name,
+            kind,
+            input.parent_id,
+            input.notes.trim(),
+            input.photo_id,
+            barcode,
+            id
         ],
     )?;
     container_by_id(conn, id)
@@ -345,11 +384,21 @@ pub fn update_container(conn: &Connection, id: i64, input: &ContainerInput) -> A
 pub fn delete_container(conn: &mut Connection, id: i64) -> AppResult<()> {
     let tx = conn.transaction()?;
     let parent: Option<i64> = tx
-        .query_row("SELECT parent_id FROM containers WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT parent_id FROM containers WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("no container with id {id}")))?;
-    tx.execute("UPDATE containers SET parent_id = ?1 WHERE parent_id = ?2", params![parent, id])?;
-    tx.execute("UPDATE items SET container_id = NULL WHERE container_id = ?1", [id])?;
+    tx.execute(
+        "UPDATE containers SET parent_id = ?1 WHERE parent_id = ?2",
+        params![parent, id],
+    )?;
+    tx.execute(
+        "UPDATE items SET container_id = NULL WHERE container_id = ?1",
+        [id],
+    )?;
     tx.execute("DELETE FROM containers WHERE id = ?1", [id])?;
     tx.commit()?;
     Ok(())
@@ -399,7 +448,13 @@ pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail
     let child_list: Vec<&Container> = all.iter().filter(|c| c.parent_id == Some(id)).collect();
     let mut wanted: Vec<i64> = vec![id];
     wanted.extend(child_list.iter().map(|c| c.id));
-    let loaded = query_items(conn, &ItemQuery { container_ids: Some(wanted), ..Default::default() })?;
+    let loaded = query_items(
+        conn,
+        &ItemQuery {
+            container_ids: Some(wanted),
+            ..Default::default()
+        },
+    )?;
 
     let mut by_container: HashMap<i64, Vec<Item>> = HashMap::new();
     for item in loaded {
@@ -452,7 +507,10 @@ pub struct ItemQuery {
 
 /// Escapes a user search term for use inside a `LIKE ... ESCAPE '\'` pattern.
 fn like_pattern(term: &str) -> String {
-    let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let escaped = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
     format!("%{escaped}%")
 }
 
@@ -488,8 +546,7 @@ pub fn query_items(conn: &Connection, query: &ItemQuery) -> AppResult<Vec<Item>>
         if query.include_nested {
             let all = all_containers(conn)?;
             let ids = descendant_ids(&all, cid);
-            let placeholders =
-                ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             sql.push_str(&format!(" AND i.container_id IN ({placeholders})"));
             for id in ids {
                 binds.push(Box::new(id));
@@ -562,10 +619,13 @@ pub fn query_items(conn: &Connection, query: &ItemQuery) -> AppResult<Vec<Item>>
     // Relevance ranking happens in Rust: SQL got us the candidate set, but a
     // name hit should always outrank a passing mention in a description.
     if !terms.is_empty() {
-        let mut scored: Vec<(i64, Item)> =
-            items.into_iter().map(|i| (score_item(&i, &terms), i)).collect();
+        let mut scored: Vec<(i64, Item)> = items
+            .into_iter()
+            .map(|i| (score_item(&i, &terms), i))
+            .collect();
         scored.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
         });
         items = scored.into_iter().map(|(_, i)| i).collect();
     }
@@ -589,7 +649,10 @@ fn score_item(item: &Item, terms: &[String]) -> i64 {
             score += 120;
         } else if name.starts_with(term) {
             score += 70;
-        } else if name.split_whitespace().any(|w| w.starts_with(term.as_str())) {
+        } else if name
+            .split_whitespace()
+            .any(|w| w.starts_with(term.as_str()))
+        {
             score += 55;
         } else if name.contains(term) {
             score += 40;
@@ -636,8 +699,10 @@ fn attach_paths(conn: &Connection, items: &mut [Item]) -> AppResult<()> {
     if !items.iter().any(|i| i.container_id.is_some()) {
         return Ok(());
     }
-    let paths: HashMap<i64, String> =
-        all_containers(conn)?.into_iter().map(|c| (c.id, c.path)).collect();
+    let paths: HashMap<i64, String> = all_containers(conn)?
+        .into_iter()
+        .map(|c| (c.id, c.path))
+        .collect();
     for item in items.iter_mut() {
         if let Some(cid) = item.container_id {
             item.container_path = paths.get(&cid).cloned();
@@ -780,10 +845,11 @@ fn set_tags(conn: &Connection, item_id: i64, tags: &[String]) -> AppResult<()> {
             continue;
         }
         conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag])?;
-        let tag_id: i64 =
-            conn.query_row("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE", [tag], |r| {
-                r.get(0)
-            })?;
+        let tag_id: i64 = conn.query_row(
+            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
+            [tag],
+            |r| r.get(0),
+        )?;
         conn.execute(
             "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
             params![item_id, tag_id],
@@ -794,7 +860,10 @@ fn set_tags(conn: &Connection, item_id: i64, tags: &[String]) -> AppResult<()> {
 }
 
 fn prune_tags(conn: &Connection) -> AppResult<()> {
-    conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM item_tags)", [])?;
+    conn.execute(
+        "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM item_tags)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -805,8 +874,12 @@ pub fn all_tags(conn: &Connection) -> AppResult<Vec<TagCount>> {
           GROUP BY t.id
           ORDER BY n DESC, t.name COLLATE NOCASE",
     )?;
-    let rows = stmt
-        .query_map([], |r| Ok(TagCount { name: r.get(0)?, item_count: r.get(1)? }))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(TagCount {
+            name: r.get(0)?,
+            item_count: r.get(1)?,
+        })
+    })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -818,15 +891,25 @@ pub fn rename_tag(conn: &mut Connection, old: &str, new: &str) -> AppResult<Stri
         return Err(AppError::bad_request("the new tag name cannot be empty"));
     }
     if new.len() > 64 {
-        return Err(AppError::bad_request("tag names are limited to 64 characters"));
+        return Err(AppError::bad_request(
+            "tag names are limited to 64 characters",
+        ));
     }
     let tx = conn.transaction()?;
     let old_id: i64 = tx
-        .query_row("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE", [old], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
+            [old],
+            |r| r.get(0),
+        )
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("no tag called {old}")))?;
     let existing: Option<i64> = tx
-        .query_row("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE", [new], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
+            [new],
+            |r| r.get(0),
+        )
         .optional()?;
 
     match existing {
@@ -840,7 +923,10 @@ pub fn rename_tag(conn: &mut Connection, old: &str, new: &str) -> AppResult<Stri
             tx.execute("DELETE FROM tags WHERE id = ?1", [old_id])?;
         }
         _ => {
-            tx.execute("UPDATE tags SET name = ?1 WHERE id = ?2", params![new, old_id])?;
+            tx.execute(
+                "UPDATE tags SET name = ?1 WHERE id = ?2",
+                params![new, old_id],
+            )?;
         }
     }
     tx.commit()?;
@@ -887,19 +973,27 @@ pub fn resolve_scan(conn: &Connection, raw: &str) -> AppResult<ScanResult> {
             .optional()?,
     };
     if let Some(id) = container_id {
-        return Ok(ScanResult::Container { container: Box::new(container_detail(conn, id)?) });
+        return Ok(ScanResult::Container {
+            container: Box::new(container_detail(conn, id)?),
+        });
     }
 
     let item_id: Option<i64> = conn
-        .query_row("SELECT id FROM items WHERE barcode = ?1 COLLATE NOCASE", [scanned], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT id FROM items WHERE barcode = ?1 COLLATE NOCASE",
+            [scanned],
+            |r| r.get(0),
+        )
         .optional()?;
     if let Some(id) = item_id {
-        return Ok(ScanResult::Item { item: Box::new(item_by_id(conn, id)?) });
+        return Ok(ScanResult::Item {
+            item: Box::new(item_by_id(conn, id)?),
+        });
     }
 
-    Ok(ScanResult::Unknown { code: scanned.to_string() })
+    Ok(ScanResult::Unknown {
+        code: scanned.to_string(),
+    })
 }
 
 // --------------------------------------------------------------------- stats
@@ -916,11 +1010,9 @@ pub fn stats(conn: &Connection) -> AppResult<Stats> {
         tags: one("SELECT COUNT(*) FROM tags")?,
         photos: one("SELECT COUNT(*) FROM photos")?,
         unfiled_items: one("SELECT COUNT(*) FROM items WHERE container_id IS NULL")?,
-        empty_containers: one(
-            "SELECT COUNT(*) FROM containers c
+        empty_containers: one("SELECT COUNT(*) FROM containers c
               WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.container_id = c.id)
-                AND NOT EXISTS (SELECT 1 FROM containers x WHERE x.parent_id = c.id)",
-        )?,
+                AND NOT EXISTS (SELECT 1 FROM containers x WHERE x.parent_id = c.id)")?,
         database_bytes: one(
             "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
         )?,
@@ -955,7 +1047,13 @@ mod tests {
         .unwrap()
     }
 
-    fn item(conn: &mut Connection, name: &str, description: &str, container: Option<i64>, tags: &[&str]) -> Item {
+    fn item(
+        conn: &mut Connection,
+        name: &str,
+        description: &str,
+        container: Option<i64>,
+        tags: &[&str],
+    ) -> Item {
         create_item(
             conn,
             &ItemInput {
@@ -1041,7 +1139,10 @@ mod tests {
         delete_container(&mut conn, shelf.id).unwrap();
 
         // The bin moves up to the garage rather than being orphaned...
-        assert_eq!(container_by_id(&conn, bin.id).unwrap().parent_id, Some(garage.id));
+        assert_eq!(
+            container_by_id(&conn, bin.id).unwrap().parent_id,
+            Some(garage.id)
+        );
         // ...and the item survives, merely unfiled.
         assert_eq!(item_by_id(&conn, hammer.id).unwrap().container_id, None);
     }
@@ -1055,7 +1156,10 @@ mod tests {
 
         let hits = query_items(
             &conn,
-            &ItemQuery { q: Some("camping stove".into()), ..Default::default() },
+            &ItemQuery {
+                q: Some("camping stove".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
@@ -1063,7 +1167,10 @@ mod tests {
 
         let none = query_items(
             &conn,
-            &ItemQuery { q: Some("camping hammer".into()), ..Default::default() },
+            &ItemQuery {
+                q: Some("camping hammer".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(none.is_empty(), "terms are ANDed together");
@@ -1075,14 +1182,24 @@ mod tests {
         let bin = container(&conn, "Holiday decorations", "bin", None);
         item(&mut conn, "String lights", "", Some(bin.id), &[]);
 
-        let by_name =
-            query_items(&conn, &ItemQuery { q: Some("holiday".into()), ..Default::default() })
-                .unwrap();
+        let by_name = query_items(
+            &conn,
+            &ItemQuery {
+                q: Some("holiday".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(by_name.len(), 1);
 
-        let by_code =
-            query_items(&conn, &ItemQuery { q: Some(bin.code.clone()), ..Default::default() })
-                .unwrap();
+        let by_code = query_items(
+            &conn,
+            &ItemQuery {
+                q: Some(bin.code.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(by_code.len(), 1);
     }
 
@@ -1092,10 +1209,18 @@ mod tests {
         item(&mut conn, "Spare bulbs", "for the drill light", None, &[]);
         item(&mut conn, "Drill", "cordless", None, &[]);
 
-        let hits =
-            query_items(&conn, &ItemQuery { q: Some("drill".into()), ..Default::default() })
-                .unwrap();
-        assert_eq!(hits[0].name, "Drill", "the item actually called Drill should come first");
+        let hits = query_items(
+            &conn,
+            &ItemQuery {
+                q: Some("drill".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hits[0].name, "Drill",
+            "the item actually called Drill should come first"
+        );
     }
 
     #[test]
@@ -1103,9 +1228,14 @@ mod tests {
         let mut conn = test_db();
         item(&mut conn, "Sandpaper", "", None, &[]);
         for query in ["%", "_", "%%"] {
-            let hits =
-                query_items(&conn, &ItemQuery { q: Some(query.into()), ..Default::default() })
-                    .unwrap();
+            let hits = query_items(
+                &conn,
+                &ItemQuery {
+                    q: Some(query.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert!(hits.is_empty(), "'{query}' must not act as a wildcard");
         }
     }
@@ -1144,14 +1274,24 @@ mod tests {
 
         let direct = query_items(
             &conn,
-            &ItemQuery { container_id: Some(garage.id), ..Default::default() },
+            &ItemQuery {
+                container_id: Some(garage.id),
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert!(direct.is_empty(), "the tent is on the shelf, not loose in the garage");
+        assert!(
+            direct.is_empty(),
+            "the tent is on the shelf, not loose in the garage"
+        );
 
         let nested = query_items(
             &conn,
-            &ItemQuery { container_id: Some(garage.id), include_nested: true, ..Default::default() },
+            &ItemQuery {
+                container_id: Some(garage.id),
+                include_nested: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(nested.len(), 1);
@@ -1189,7 +1329,10 @@ mod tests {
             [shelf.id],
         )
         .unwrap();
-        assert!(!container_by_id(&conn, shelf.id).unwrap().stale, "nothing inside to verify");
+        assert!(
+            !container_by_id(&conn, shelf.id).unwrap().stale,
+            "nothing inside to verify"
+        );
     }
 
     #[test]
@@ -1203,9 +1346,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!container_by_id(&conn, bin.id).unwrap().stale, "60 days is inside the default");
+        assert!(
+            !container_by_id(&conn, bin.id).unwrap().stale,
+            "60 days is inside the default"
+        );
         crate::db::set_setting(&conn, "stale_after_days", "30").unwrap();
-        assert!(container_by_id(&conn, bin.id).unwrap().stale, "but outside a 30 day window");
+        assert!(
+            container_by_id(&conn, bin.id).unwrap().stale,
+            "but outside a 30 day window"
+        );
     }
 
     #[test]
@@ -1227,7 +1376,10 @@ mod tests {
             .collect();
         assert!(names.contains(&vec!["Stove".to_string(), "Tent".to_string()]));
         assert!(names.contains(&vec!["Wreath".to_string()]));
-        assert_eq!(detail.nested_item_count, 3, "the shelf holds three things in total");
+        assert_eq!(
+            detail.nested_item_count, 3,
+            "the shelf holds three things in total"
+        );
     }
 
     #[test]
@@ -1253,7 +1405,10 @@ mod tests {
         let tags = all_tags(&conn).unwrap();
         assert_eq!(tags.len(), 1, "the two tags become one");
         assert_eq!(tags[0].item_count, 2);
-        assert_eq!(item_by_id(&conn, drill.id).unwrap().tags, vec!["tools".to_string()]);
+        assert_eq!(
+            item_by_id(&conn, drill.id).unwrap().tags,
+            vec!["tools".to_string()]
+        );
     }
 
     #[test]
@@ -1261,10 +1416,18 @@ mod tests {
         let mut conn = test_db();
         let drill = item(&mut conn, "Drill", "", None, &["tools", "loud"]);
         delete_tag(&conn, "loud").unwrap();
-        assert_eq!(item_by_id(&conn, drill.id).unwrap().tags, vec!["tools".to_string()]);
+        assert_eq!(
+            item_by_id(&conn, drill.id).unwrap().tags,
+            vec!["tools".to_string()]
+        );
     }
 
-    fn with_barcode(conn: &mut Connection, name: &str, barcode: &str, container: Option<i64>) -> Item {
+    fn with_barcode(
+        conn: &mut Connection,
+        name: &str,
+        barcode: &str,
+        container: Option<i64>,
+    ) -> Item {
         create_item(
             conn,
             &ItemInput {
@@ -1353,7 +1516,10 @@ mod tests {
             },
         );
         assert!(clash.is_err(), "one scan must resolve to one thing");
-        assert!(clash.unwrap_err().message.contains("already assigned to Drill"));
+        assert!(clash
+            .unwrap_err()
+            .message
+            .contains("already assigned to Drill"));
     }
 
     #[test]

@@ -17,12 +17,24 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -70,7 +82,11 @@ pub async fn export_json(
         let photos: Vec<Value> = if params.photos {
             let mut stmt = c.prepare("SELECT id, mime, bytes FROM photos ORDER BY id")?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
             })?;
             rows.map(|row| {
                 row.map(|(id, mime, bytes)| {
@@ -107,7 +123,8 @@ pub async fn export_json(
 }
 
 fn now(conn: &rusqlite::Connection) -> String {
-    conn.query_row("SELECT datetime('now')", [], |r| r.get::<_, String>(0)).unwrap_or_default()
+    conn.query_row("SELECT datetime('now')", [], |r| r.get::<_, String>(0))
+        .unwrap_or_default()
 }
 
 fn csv_field(value: &str) -> String {
@@ -150,7 +167,10 @@ pub async fn export_csv(State(st): State<AppState>) -> AppResult<Response> {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
-        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"packrat.csv\"")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"packrat.csv\"",
+        )
         .body(axum::body::Body::from(csv))
         .map_err(|e| AppError::internal(e.to_string()))
 }

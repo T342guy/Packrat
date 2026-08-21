@@ -8,7 +8,8 @@ pub type Pool = r2d2::Pool<SqliteConnectionManager>;
 pub fn open(path: &std::path::Path) -> Result<Pool, String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
         }
     }
     let manager = SqliteConnectionManager::file(path).with_init(|c| {
@@ -139,12 +140,14 @@ where
 }
 
 pub fn get_setting(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other),
+    })
 }
 
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {

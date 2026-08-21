@@ -5,8 +5,8 @@
 //! code on a box to see what's inside without opening it.
 
 mod api;
-mod barcode;
 mod backup;
+mod barcode;
 mod db;
 mod error;
 mod media;
@@ -73,15 +73,50 @@ OPTIONS:
         --seed-example      Populate an empty database with a small example inventory
     -h, --help              Print this help
     -V, --version           Print version
+
+ENVIRONMENT:
+    Every option can be set by environment variable instead, which is usually
+    easier in a container. Command line flags win over environment variables.
+
+    PACKRAT_PORT, PACKRAT_HOST, PACKRAT_DB, PACKRAT_PUBLIC_URL, PACKRAT_SEED_EXAMPLE
 ";
 
+/// Reads an option from the environment, ignoring blanks so an empty variable
+/// in a compose file behaves the same as an unset one.
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// True when we appear to be inside a container, where the address the server
+/// detects for itself is not one any phone can reach.
+fn in_container() -> bool {
+    std::path::Path::new("/.dockerenv").exists()
+        || std::fs::read_to_string("/proc/1/cgroup")
+            .map(|c| c.contains("docker") || c.contains("containerd") || c.contains("kubepods"))
+            .unwrap_or(false)
+}
+
 fn parse_args() -> Result<Args, String> {
+    // Environment first, command line second — flags override the environment.
     let mut args = Args {
-        port: 8080,
-        host: "0.0.0.0".to_string(),
-        database: PathBuf::from("inventory.db"),
-        public_url: None,
-        seed_example: false,
+        port: match env_var("PACKRAT_PORT") {
+            Some(p) => p
+                .parse()
+                .map_err(|_| "PACKRAT_PORT must be a number".to_string())?,
+            None => 8080,
+        },
+        host: env_var("PACKRAT_HOST").unwrap_or_else(|| "0.0.0.0".to_string()),
+        database: PathBuf::from(
+            env_var("PACKRAT_DB").unwrap_or_else(|| "inventory.db".to_string()),
+        ),
+        public_url: env_var("PACKRAT_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_string()),
+        seed_example: matches!(
+            env_var("PACKRAT_SEED_EXAMPLE").as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        ),
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -96,7 +131,9 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-p" | "--port" => {
-                args.port = value()?.parse().map_err(|_| "port must be a number".to_string())?
+                args.port = value()?
+                    .parse()
+                    .map_err(|_| "port must be a number".to_string())?
             }
             "--host" => args.host = value()?,
             "-d" | "--db" | "--database" => args.database = PathBuf::from(value()?),
@@ -135,7 +172,9 @@ async fn run() -> Result<(), String> {
     // saved in Settings, and finally to the detected LAN address.
     let stored = {
         let conn = pool.get().map_err(|e| e.to_string())?;
-        db::get_setting(&conn, "public_url").map_err(|e| e.to_string())?.filter(|s| !s.is_empty())
+        db::get_setting(&conn, "public_url")
+            .map_err(|e| e.to_string())?
+            .filter(|s| !s.is_empty())
     };
     let state = AppState {
         pool,
@@ -158,9 +197,29 @@ async fn run() -> Result<(), String> {
     println!("  database   {}", absolute.display());
     println!("  local      http://localhost:{}", args.port);
     if let Some(ip) = state.lan_ip {
-        println!("  network    http://{}:{}   ← open this on your phone", ip, args.port);
+        println!(
+            "  network    http://{}:{}   ← open this on your phone",
+            ip, args.port
+        );
     }
     println!("  QR links   {}", state.public_url());
+    // In a container the detected address belongs to the container network, so
+    // QR codes would point somewhere no phone can reach. Say so loudly.
+    if in_container()
+        && state
+            .public_url_override
+            .read()
+            .map(|u| u.is_none())
+            .unwrap_or(false)
+    {
+        println!(
+            "\n  ⚠ Running in a container with no public URL set, so QR codes point at\n    \
+             {} — an address inside the container network that phones cannot reach.\n    \
+             Set PACKRAT_PUBLIC_URL to the host's address, e.g. http://192.168.1.24:{}",
+            state.public_url(),
+            args.port
+        );
+    }
     println!("\n  No password is required, so keep this on a network you trust.");
     println!("  Press Ctrl-C to stop.\n");
 
@@ -188,13 +247,19 @@ fn router(state: AppState) -> Router {
         .route("/labels", get(media::print_labels))
         .route("/api/label-formats", get(media::label_formats))
         // Containers
-        .route("/api/containers", get(api::list_containers).post(api::create_container))
+        .route(
+            "/api/containers",
+            get(api::list_containers).post(api::create_container),
+        )
         .route("/api/containers/{id}", get(api::get_container))
         .route("/api/containers/{id}", put(api::update_container))
         .route("/api/containers/{id}", delete(api::delete_container))
         .route("/api/containers/{id}/qr.svg", get(media::container_qr))
         .route("/api/containers/{id}/verify", post(api::verify_container))
-        .route("/api/containers/{id}/barcode.svg", get(media::container_barcode))
+        .route(
+            "/api/containers/{id}/barcode.svg",
+            get(media::container_barcode),
+        )
         .route("/api/scan/{code}", get(api::scan))
         .route("/api/stale", get(api::stale_containers))
         .route("/api/by-code/{code}", get(api::get_container_by_code))
@@ -209,10 +274,17 @@ fn router(state: AppState) -> Router {
         // Lookup and meta
         .route("/api/search", get(api::search))
         .route("/api/tags", get(api::list_tags))
-        .route("/api/tags/{name}", put(api::rename_tag).delete(api::delete_tag))
+        .route(
+            "/api/tags/{name}",
+            put(api::rename_tag).delete(api::delete_tag),
+        )
         .route("/api/stats", get(api::stats))
         .route("/api/bootstrap", get(api::bootstrap))
-        .route("/api/settings", get(api::get_settings).put(api::update_settings))
+        .route("/api/health", get(api::health))
+        .route(
+            "/api/settings",
+            get(api::get_settings).put(api::update_settings),
+        )
         // Photos
         .route("/api/photos", post(media::upload_photo))
         .route("/photos/{id}", get(media::get_photo))
@@ -226,8 +298,10 @@ fn router(state: AppState) -> Router {
 }
 
 async fn scan_redirect(axum::extract::Path(code): axum::extract::Path<String>) -> Redirect {
-    let safe: String =
-        code.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    let safe: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
     Redirect::to(&format!("/#/box/{safe}"))
 }
 
@@ -248,19 +322,31 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
 }
 
 async fn index() -> Response {
-    asset("text/html; charset=utf-8", include_str!("../static/index.html"))
+    asset(
+        "text/html; charset=utf-8",
+        include_str!("../static/index.html"),
+    )
 }
 async fn app_js() -> Response {
-    asset("application/javascript; charset=utf-8", include_str!("../static/app.js"))
+    asset(
+        "application/javascript; charset=utf-8",
+        include_str!("../static/app.js"),
+    )
 }
 async fn styles_css() -> Response {
-    asset("text/css; charset=utf-8", include_str!("../static/styles.css"))
+    asset(
+        "text/css; charset=utf-8",
+        include_str!("../static/styles.css"),
+    )
 }
 async fn icon_svg() -> Response {
     asset("image/svg+xml", include_str!("../static/icon.svg"))
 }
 async fn manifest() -> Response {
-    asset("application/manifest+json", include_str!("../static/manifest.webmanifest"))
+    asset(
+        "application/manifest+json",
+        include_str!("../static/manifest.webmanifest"),
+    )
 }
 
 /// Fills an empty database with a plausible garage so the app has something to
@@ -286,7 +372,9 @@ fn seed_example(conn: &mut rusqlite::Connection) -> Result<bool, String> {
             code: None,
             barcode: None,
         };
-        store::create_container(conn, &input).map(|c| c.id).map_err(|e| e.message)
+        store::create_container(conn, &input)
+            .map(|c| c.id)
+            .map_err(|e| e.message)
     };
 
     let garage = make_container(conn, "Garage", "area", None)?;
@@ -297,15 +385,69 @@ fn seed_example(conn: &mut rusqlite::Connection) -> Result<bool, String> {
     let fasteners = make_container(conn, "Fasteners", "drawer", Some(workbench))?;
 
     let seed_items: &[(&str, &str, i64, i64, &[&str])] = &[
-        ("4-person tent", "Blue dome tent, poles in side pocket", 1, camping, &["camping", "outdoors"]),
-        ("Sleeping bags", "Two mummy bags, rated 0°C", 2, camping, &["camping"]),
-        ("Camping stove", "Propane, needs a full canister", 1, camping, &["camping", "cooking"]),
-        ("String lights", "Warm white, 3 strands, one has a dead bulb", 3, holiday, &["holiday"]),
-        ("Wreath", "Front door wreath in a paper sleeve", 1, holiday, &["holiday"]),
-        ("Wood screws #8 x 1½\"", "Roughly half a box left", 1, fasteners, &["hardware", "screws"]),
-        ("Drywall anchors", "Assorted sizes in a plastic case", 1, fasteners, &["hardware"]),
-        ("Cordless drill", "Battery on the charger by the door", 1, workbench, &["tools", "power-tools"]),
-        ("Extension cord 25ft", "Orange, heavy gauge", 2, workbench, &["tools", "electrical"]),
+        (
+            "4-person tent",
+            "Blue dome tent, poles in side pocket",
+            1,
+            camping,
+            &["camping", "outdoors"],
+        ),
+        (
+            "Sleeping bags",
+            "Two mummy bags, rated 0°C",
+            2,
+            camping,
+            &["camping"],
+        ),
+        (
+            "Camping stove",
+            "Propane, needs a full canister",
+            1,
+            camping,
+            &["camping", "cooking"],
+        ),
+        (
+            "String lights",
+            "Warm white, 3 strands, one has a dead bulb",
+            3,
+            holiday,
+            &["holiday"],
+        ),
+        (
+            "Wreath",
+            "Front door wreath in a paper sleeve",
+            1,
+            holiday,
+            &["holiday"],
+        ),
+        (
+            "Wood screws #8 x 1½\"",
+            "Roughly half a box left",
+            1,
+            fasteners,
+            &["hardware", "screws"],
+        ),
+        (
+            "Drywall anchors",
+            "Assorted sizes in a plastic case",
+            1,
+            fasteners,
+            &["hardware"],
+        ),
+        (
+            "Cordless drill",
+            "Battery on the charger by the door",
+            1,
+            workbench,
+            &["tools", "power-tools"],
+        ),
+        (
+            "Extension cord 25ft",
+            "Orange, heavy gauge",
+            2,
+            workbench,
+            &["tools", "electrical"],
+        ),
     ];
     for (name, description, quantity, container, tags) in seed_items {
         let input = models::ItemInput {

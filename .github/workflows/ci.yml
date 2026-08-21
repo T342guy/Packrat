@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lints
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Smoke test the binary
+        run: |
+          set -euo pipefail
+          ./target/release/packrat --db "$RUNNER_TEMP/ci.db" --port 8099 --seed-example &
+          server=$!
+          trap 'kill $server' EXIT
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8099/api/health >/dev/null 2>&1; then break; fi
+            sleep 0.25
+          done
+          curl -fsS http://127.0.0.1:8099/api/health
+          # The seeded inventory should be queryable end to end.
+          curl -fsS "http://127.0.0.1:8099/api/search?q=tent" | grep -q "4-person tent"
+          # And a label sheet should render, QR codes and all.
+          curl -fsS "http://127.0.0.1:8099/labels?format=dymo-30334&symbols=both" | grep -q "<svg"
+          echo "smoke test passed"

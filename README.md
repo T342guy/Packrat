@@ -12,9 +12,45 @@ screen.
 
 ## Quick start
 
+Three ways in, in increasing order of permanence.
+
+**Try it:**
+
 ```bash
 cargo run --release -- --seed-example    # drop --seed-example for an empty inventory
 ```
+
+**Run it in a container:**
+
+```bash
+docker run -d --name packrat --restart unless-stopped \
+  -p 8080:8080 -v packrat-data:/data \
+  -e PACKRAT_PUBLIC_URL=http://192.168.1.24:8080 \
+  ghcr.io/t342guy/packrat:latest
+```
+
+Images are built for x86-64 and arm64, so the same command works on a Raspberry
+Pi. `PACKRAT_PUBLIC_URL` matters here: QR codes encode an absolute address, and
+inside a container Packrat can only see its own container-network address, which
+no phone can reach — so tell it the host's address on your LAN. It says so on
+startup if you forget. There's a `docker-compose.yml` in the repo if you'd
+rather keep the settings in a file.
+
+**Install it properly, starting at boot:**
+
+```bash
+sudo scripts/install.sh                  # system service, survives reboots
+scripts/install.sh --user                # just for you, no root needed
+scripts/install.sh --dry-run             # print the service file, change nothing
+sudo scripts/install.sh --uninstall      # keeps your database
+```
+
+On Linux that writes a systemd unit (a sandboxed system service running as a
+dedicated `packrat` account, or a user service with lingering enabled so it
+starts without anyone logging in). On macOS it writes a LaunchDaemon under sudo,
+or a LaunchAgent without. It builds from source if you have Rust, uses a binary
+you already have if you don't, and points you at the container image if neither
+applies. Uninstalling never touches the database.
 
 Then open <http://localhost:8080>, or the `http://<your-ip>:8080` address the
 server prints, from a phone on the same network.
@@ -30,13 +66,19 @@ server prints, from a phone on the same network.
 
 ### Options
 
-| Flag | Default | Meaning |
+Every flag can also be set by environment variable — usually easier in a
+container. Flags win over the environment.
+
+| Flag | Environment | Default | Meaning |
 | --- | --- | --- |
-| `-p, --port <PORT>` | `8080` | Port to listen on |
-| `--host <ADDR>` | `0.0.0.0` | Bind address — the default makes it reachable on your LAN |
-| `-d, --db <PATH>` | `./inventory.db` | Where the SQLite database lives |
-| `--public-url <URL>` | auto-detected LAN address | Base URL encoded into QR codes |
-| `--seed-example` | off | Fill an empty database with a small example garage |
+| `-p, --port <PORT>` | `PACKRAT_PORT` | `8080` | Port to listen on |
+| `--host <ADDR>` | `PACKRAT_HOST` | `0.0.0.0` | Bind address — the default makes it reachable on your LAN |
+| `-d, --db <PATH>` | `PACKRAT_DB` | `./inventory.db` | Where the SQLite database lives |
+| `--public-url <URL>` | `PACKRAT_PUBLIC_URL` | auto-detected LAN address | Base URL encoded into QR codes |
+| `--seed-example` | `PACKRAT_SEED_EXAMPLE` | off | Fill an empty database with a small example garage |
+
+`GET /api/health` returns `{"ok":true}` after touching the database, for
+container health checks and uptime monitors.
 
 For a build you can copy anywhere:
 
@@ -272,6 +314,16 @@ local network — which is what makes phone scanning work. Run it on a network
 you trust, and don't port-forward it to the internet. To keep it to the machine
 it runs on, use `--host 127.0.0.1` (QR scanning from a phone won't work then).
 
+## Builds
+
+Every push runs formatting, clippy with warnings denied, the unit tests, a
+release build, and a smoke test that starts the binary and queries it. Pushes to
+`main` and version tags publish a multi-architecture container image to
+`ghcr.io/t342guy/packrat` — `latest` from `main`, plus semver tags from `v*`
+tags. The arm64 half is built under emulation, so that job takes a while; if you
+want it faster, split the build across native `ubuntu-latest` and
+`ubuntu-24.04-arm` runners and merge the manifests.
+
 ## Development
 
 ```bash
@@ -290,4 +342,6 @@ src/media.rs    photos, QR codes, printable labels
 src/barcode.rs  Code 128 encoding
 src/backup.rs   export and import
 static/         frontend, embedded into the binary at compile time
+Dockerfile      two-stage build; the runtime image is Alpine plus the binary
+scripts/        install.sh — installs the binary and registers it to autostart
 ```

@@ -40,14 +40,18 @@ impl From<ItemQueryParams> for ItemQuery {
 // ---------------------------------------------------------------- containers
 
 pub async fn list_containers(State(st): State<AppState>) -> AppResult<Json<Vec<Container>>> {
-    db::run(&st.pool, |c| store::all_containers(c)).await.map(Json)
+    db::run(&st.pool, |c| store::all_containers(c))
+        .await
+        .map(Json)
 }
 
 pub async fn get_container(
     State(st): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<ContainerDetail>> {
-    db::run(&st.pool, move |c| store::container_detail(c, id)).await.map(Json)
+    db::run(&st.pool, move |c| store::container_detail(c, id))
+        .await
+        .map(Json)
 }
 
 pub async fn get_container_by_code(
@@ -66,7 +70,9 @@ pub async fn create_container(
     State(st): State<AppState>,
     Json(input): Json<ContainerInput>,
 ) -> AppResult<Json<Container>> {
-    db::run(&st.pool, move |c| store::create_container(c, &input)).await.map(Json)
+    db::run(&st.pool, move |c| store::create_container(c, &input))
+        .await
+        .map(Json)
 }
 
 pub async fn update_container(
@@ -74,7 +80,9 @@ pub async fn update_container(
     Path(id): Path<i64>,
     Json(input): Json<ContainerInput>,
 ) -> AppResult<Json<Container>> {
-    db::run(&st.pool, move |c| store::update_container(c, id, &input)).await.map(Json)
+    db::run(&st.pool, move |c| store::update_container(c, id, &input))
+        .await
+        .map(Json)
 }
 
 pub async fn delete_container(
@@ -95,7 +103,9 @@ pub async fn verify_container(
     State(st): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Container>> {
-    db::run(&st.pool, move |c| store::mark_checked(c, id)).await.map(Json)
+    db::run(&st.pool, move |c| store::mark_checked(c, id))
+        .await
+        .map(Json)
 }
 
 /// Containers holding items that haven't been verified within the staleness
@@ -103,10 +113,14 @@ pub async fn verify_container(
 pub async fn stale_containers(State(st): State<AppState>) -> AppResult<Json<Value>> {
     db::run(&st.pool, |c| {
         let days = store::stale_after_days(c);
-        let mut stale: Vec<Container> =
-            store::all_containers(c)?.into_iter().filter(|x| x.stale).collect();
+        let mut stale: Vec<Container> = store::all_containers(c)?
+            .into_iter()
+            .filter(|x| x.stale)
+            .collect();
         stale.sort_by(|a, b| b.age_days.cmp(&a.age_days));
-        Ok(Json(json!({ "stale_after_days": days, "containers": stale })))
+        Ok(Json(
+            json!({ "stale_after_days": days, "containers": stale }),
+        ))
     })
     .await
 }
@@ -118,18 +132,24 @@ pub async fn list_items(
     Query(params): Query<ItemQueryParams>,
 ) -> AppResult<Json<Vec<Item>>> {
     let query: ItemQuery = params.into();
-    db::run(&st.pool, move |c| store::query_items(c, &query)).await.map(Json)
+    db::run(&st.pool, move |c| store::query_items(c, &query))
+        .await
+        .map(Json)
 }
 
 pub async fn get_item(State(st): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Item>> {
-    db::run(&st.pool, move |c| store::item_by_id(c, id)).await.map(Json)
+    db::run(&st.pool, move |c| store::item_by_id(c, id))
+        .await
+        .map(Json)
 }
 
 pub async fn create_item(
     State(st): State<AppState>,
     Json(input): Json<ItemInput>,
 ) -> AppResult<Json<Item>> {
-    db::run(&st.pool, move |c| store::create_item(c, &input)).await.map(Json)
+    db::run(&st.pool, move |c| store::create_item(c, &input))
+        .await
+        .map(Json)
 }
 
 pub async fn update_item(
@@ -137,10 +157,15 @@ pub async fn update_item(
     Path(id): Path<i64>,
     Json(input): Json<ItemInput>,
 ) -> AppResult<Json<Item>> {
-    db::run(&st.pool, move |c| store::update_item(c, id, &input)).await.map(Json)
+    db::run(&st.pool, move |c| store::update_item(c, id, &input))
+        .await
+        .map(Json)
 }
 
-pub async fn delete_item(State(st): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Value>> {
+pub async fn delete_item(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<Value>> {
     db::run(&st.pool, move |c| {
         store::delete_item(c, id)?;
         crate::media::prune_photos(c)?;
@@ -154,7 +179,11 @@ pub async fn move_item(
     Path(id): Path<i64>,
     Json(input): Json<MoveInput>,
 ) -> AppResult<Json<Item>> {
-    db::run(&st.pool, move |c| store::move_item(c, id, input.container_id)).await.map(Json)
+    db::run(&st.pool, move |c| {
+        store::move_item(c, id, input.container_id)
+    })
+    .await
+    .map(Json)
 }
 
 pub async fn adjust_quantity(
@@ -162,7 +191,11 @@ pub async fn adjust_quantity(
     Path(id): Path<i64>,
     Json(input): Json<QuantityInput>,
 ) -> AppResult<Json<Item>> {
-    db::run(&st.pool, move |c| store::adjust_quantity(c, id, input.delta)).await.map(Json)
+    db::run(&st.pool, move |c| {
+        store::adjust_quantity(c, id, input.delta)
+    })
+    .await
+    .map(Json)
 }
 
 /// Bulk move — "I just emptied this box into that one".
@@ -192,8 +225,13 @@ pub async fn bulk_move(
 
 /// Resolves a scanned barcode or label code to whatever it identifies. This is
 /// the endpoint a barcode scanner drives: everything else follows from it.
-pub async fn scan(State(st): State<AppState>, Path(code): Path<String>) -> AppResult<Json<ScanResult>> {
-    db::run(&st.pool, move |c| store::resolve_scan(c, &code)).await.map(Json)
+pub async fn scan(
+    State(st): State<AppState>,
+    Path(code): Path<String>,
+) -> AppResult<Json<ScanResult>> {
+    db::run(&st.pool, move |c| store::resolve_scan(c, &code))
+        .await
+        .map(Json)
 }
 
 // ------------------------------------------------------------ search & meta
@@ -218,10 +256,17 @@ pub async fn search(
         }
         let items = store::query_items(
             c,
-            &ItemQuery { q: Some(q.clone()), limit: Some(limit), ..Default::default() },
+            &ItemQuery {
+                q: Some(q.clone()),
+                limit: Some(limit),
+                ..Default::default()
+            },
         )?;
-        let terms: Vec<String> =
-            q.split_whitespace().map(|t| t.to_lowercase()).take(8).collect();
+        let terms: Vec<String> = q
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .take(8)
+            .collect();
         let containers: Vec<Container> = store::all_containers(c)?
             .into_iter()
             .filter(|ct| {
@@ -231,7 +276,9 @@ pub async fn search(
             })
             .take(50)
             .collect();
-        Ok(Json(json!({ "query": q, "items": items, "containers": containers })))
+        Ok(Json(
+            json!({ "query": q, "items": items, "containers": containers }),
+        ))
     })
     .await
 }
@@ -264,6 +311,20 @@ pub async fn delete_tag(
     db::run(&st.pool, move |c| {
         store::delete_tag(c, &name)?;
         Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+/// Liveness probe: cheap, and it touches the database so a wedged file shows
+/// up as unhealthy rather than merely quiet.
+pub async fn health(State(st): State<AppState>) -> AppResult<Json<Value>> {
+    db::run(&st.pool, |c| {
+        let containers: i64 = c.query_row("SELECT COUNT(*) FROM containers", [], |r| r.get(0))?;
+        Ok(Json(json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "containers": containers,
+        })))
     })
     .await
 }
@@ -315,7 +376,9 @@ pub async fn update_settings(
             .parse()
             .map_err(|_| AppError::bad_request("re-check reminder must be a number of days"))?;
         if !(1..=3650).contains(&days) {
-            return Err(AppError::bad_request("re-check reminder must be between 1 and 3650 days"));
+            return Err(AppError::bad_request(
+                "re-check reminder must be between 1 and 3650 days",
+            ));
         }
         db::run(&st.pool, move |c| {
             db::set_setting(c, "stale_after_days", &days.to_string())
@@ -324,12 +387,21 @@ pub async fn update_settings(
         .await?;
     }
     if !body.contains_key("public_url") {
-        return Ok(Json(json!({ "ok": true, "effective_public_url": st.public_url() })));
+        return Ok(Json(
+            json!({ "ok": true, "effective_public_url": st.public_url() }),
+        ));
     }
-    let url = body.get("public_url").cloned().unwrap_or_default().trim().to_string();
+    let url = body
+        .get("public_url")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let has_scheme = url.starts_with("http://") || url.starts_with("https://");
     if !url.is_empty() && !has_scheme {
-        return Err(AppError::bad_request("public URL must start with http:// or https://"));
+        return Err(AppError::bad_request(
+            "public URL must start with http:// or https://",
+        ));
     }
     let url = url.trim_end_matches('/').to_string();
     let stored = url.clone();
@@ -339,5 +411,7 @@ pub async fn update_settings(
     })
     .await?;
     *st.public_url_override.write().unwrap() = if url.is_empty() { None } else { Some(url) };
-    Ok(Json(json!({ "ok": true, "effective_public_url": st.public_url() })))
+    Ok(Json(
+        json!({ "ok": true, "effective_public_url": st.public_url() }),
+    ))
 }

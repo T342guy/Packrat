@@ -1,0 +1,30 @@
+services:
+  packrat:
+    image: ghcr.io/t342guy/packrat:latest
+    # To build from a checkout instead of pulling, comment the image line and
+    # uncomment this:
+    # build: .
+    container_name: packrat
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # REQUIRED in a container. QR codes encode an absolute URL, and inside a
+      # container Packrat can only detect its own container-network address —
+      # which no phone can reach. Set this to the host's address on your LAN.
+      PACKRAT_PUBLIC_URL: "http://192.168.1.24:8080"
+      # PACKRAT_SEED_EXAMPLE: "1"   # example inventory on first run
+    volumes:
+      # A named volume avoids file-ownership surprises. To use a directory on
+      # the host instead, swap in `- ./data:/data` and make it writable by the
+      # container's user first: sudo chown -R 10001:10001 ./data
+      - packrat-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  packrat-data:

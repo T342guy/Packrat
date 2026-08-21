@@ -55,8 +55,9 @@ pub async fn upload_photo(
         if data.len() > MAX_PHOTO_BYTES {
             return Err(AppError::bad_request("image is larger than 12 MB"));
         }
-        let mime = sniff_image_mime(&data)
-            .ok_or_else(|| AppError::bad_request("only JPEG, PNG, GIF or WebP images are accepted"))?;
+        let mime = sniff_image_mime(&data).ok_or_else(|| {
+            AppError::bad_request("only JPEG, PNG, GIF or WebP images are accepted")
+        })?;
         let bytes = data.to_vec();
         let id = db::run(&st.pool, move |c| {
             c.execute(
@@ -73,9 +74,11 @@ pub async fn upload_photo(
 
 pub async fn get_photo(State(st): State<AppState>, Path(id): Path<i64>) -> AppResult<Response> {
     let (mime, bytes): (String, Vec<u8>) = db::run(&st.pool, move |c| {
-        Ok(c.query_row("SELECT mime, bytes FROM photos WHERE id = ?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?)
+        Ok(
+            c.query_row("SELECT mime, bytes FROM photos WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?,
+        )
     })
     .await?;
     Response::builder()
@@ -115,7 +118,10 @@ fn qr_svg(data: &str, size: u32) -> AppResult<String> {
 /// The barcode printed on a container's label: a pre-printed one if it has
 /// been assigned, otherwise the container's own label code.
 fn scannable_code(container: &crate::models::Container) -> String {
-    container.barcode.clone().unwrap_or_else(|| container.code.clone())
+    container
+        .barcode
+        .clone()
+        .unwrap_or_else(|| container.code.clone())
 }
 
 pub async fn container_barcode(
@@ -143,8 +149,14 @@ pub async fn container_qr(
     Query(params): Query<QrParams>,
 ) -> AppResult<Response> {
     let base = st.public_url();
-    let code = db::run(&st.pool, move |c| store::container_by_id(c, id).map(|x| x.code)).await?;
-    let svg = qr_svg(&format!("{base}/b/{code}"), params.size.unwrap_or(240).clamp(64, 2048))?;
+    let code = db::run(&st.pool, move |c| {
+        store::container_by_id(c, id).map(|x| x.code)
+    })
+    .await?;
+    let svg = qr_svg(
+        &format!("{base}/b/{code}"),
+        params.size.unwrap_or(240).clamp(64, 2048),
+    )?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/svg+xml")
@@ -366,7 +378,11 @@ fn plan_layout(
         None => (SHEET_WIDTH_MM / format.columns as f32, f32::MAX),
     };
     let avail_w = width - 2.0 * PAD_MM;
-    let avail_h = if height == f32::MAX { f32::MAX } else { height - 2.0 * PAD_MM };
+    let avail_h = if height == f32::MAX {
+        f32::MAX
+    } else {
+        height - 2.0 * PAD_MM
+    };
 
     let mut place = BarcodePlace::Below;
     let mut qr_mm = format.qr_mm.min(avail_h);
@@ -435,10 +451,13 @@ pub async fn print_labels(
     Query(params): Query<LabelParams>,
 ) -> AppResult<Html<String>> {
     let base = st.public_url();
-    let requested = params.format.clone().unwrap_or_else(|| match params.size.as_deref() {
-        Some("small") => "sheet-small".to_string(),
-        _ => "sheet-large".to_string(),
-    });
+    let requested = params
+        .format
+        .clone()
+        .unwrap_or_else(|| match params.size.as_deref() {
+            Some("small") => "sheet-small".to_string(),
+            _ => "sheet-large".to_string(),
+        });
     let custom;
     let format = match find_format(&requested) {
         Some(f) => f,
@@ -451,10 +470,16 @@ pub async fn print_labels(
     let on_paper = format.page_mm.is_none();
 
     let wanted: Option<Vec<String>> = params.codes.as_ref().filter(|_| !params.all).map(|c| {
-        c.split(',').map(store::normalize_code).filter(|s| !s.is_empty()).collect()
+        c.split(',')
+            .map(store::normalize_code)
+            .filter(|s| !s.is_empty())
+            .collect()
     });
 
-    let label_width = format.page_mm.map(|(w, _)| w).unwrap_or(SHEET_WIDTH_MM / format.columns as f32);
+    let label_width = format
+        .page_mm
+        .map(|(w, _)| w)
+        .unwrap_or(SHEET_WIDTH_MM / format.columns as f32);
     let symbols = params.symbols.as_deref().unwrap_or("auto");
     let want_qr = matches!(symbols, "auto" | "qr" | "both");
     let mut want_barcode = match symbols {
@@ -470,9 +495,10 @@ pub async fn print_labels(
         move |c| {
             let all = store::all_containers(c)?;
             Ok(match &wanted {
-                Some(codes) if !codes.is_empty() => {
-                    all.into_iter().filter(|x| codes.contains(&x.code.to_uppercase())).collect()
-                }
+                Some(codes) if !codes.is_empty() => all
+                    .into_iter()
+                    .filter(|x| codes.contains(&x.code.to_uppercase()))
+                    .collect(),
                 _ => all,
             })
         }
@@ -537,8 +563,19 @@ pub async fn print_labels(
     }
 
     let mut body = String::new();
-    body.push_str(&toolbar(format, symbols, want_qr, want_barcode, &layout, on_paper, tape));
-    body.push_str(&format!("<div class=\"sheet {}\">", if on_paper { "paper" } else { "roll" }));
+    body.push_str(&toolbar(
+        format,
+        symbols,
+        want_qr,
+        want_barcode,
+        &layout,
+        on_paper,
+        tape,
+    ));
+    body.push_str(&format!(
+        "<div class=\"sheet {}\">",
+        if on_paper { "paper" } else { "roll" }
+    ));
 
     for (container, items) in &containers {
         let url = format!("{}/b/{}", base, container.code);
@@ -632,7 +669,11 @@ pub async fn print_labels(
                  {tape_bottom}
                </div>"#,
             stacked = if format.stacked { " stacked" } else { "" },
-            barcode_only = if want_barcode && !want_qr { " barcode-only" } else { "" },
+            barcode_only = if want_barcode && !want_qr {
+                " barcode-only"
+            } else {
+                ""
+            },
             taped = if tape { " taped" } else { "" },
             tape_top = tape_top,
             qr = qr,
@@ -689,7 +730,11 @@ fn toolbar(
     // discover an unscannable label after cutting it out.
     let mut notes = String::new();
     if want_qr {
-        let class = if layout.qr_module_mm < MIN_QR_MODULE_MM { "help warn" } else { "help" };
+        let class = if layout.qr_module_mm < MIN_QR_MODULE_MM {
+            "help warn"
+        } else {
+            "help"
+        };
         let verdict = if layout.qr_module_mm < MIN_QR_MODULE_MM {
             " — that is tight for a phone camera. Use larger stock, or print the barcode only \
              and scan it with a laser scanner."
@@ -702,7 +747,11 @@ fn toolbar(
         ));
     }
     if want_barcode {
-        let class = if layout.bar_mm < MIN_BAR_MM { "help warn" } else { "help" };
+        let class = if layout.bar_mm < MIN_BAR_MM {
+            "help warn"
+        } else {
+            "help"
+        };
         let verdict = if layout.bar_mm < MIN_BAR_MM {
             " — too fine for most laser scanners, which want 0.33 mm or more. Use wider stock."
         } else {
@@ -790,7 +839,11 @@ fn toolbar(
              }}
            </script>"#,
         options = options,
-        custom = if format.id == "custom" { " selected" } else { "" },
+        custom = if format.id == "custom" {
+            " selected"
+        } else {
+            ""
+        },
         symbol_options = symbol_options,
         tape_toggle = tape_toggle,
         notes = notes,
@@ -830,7 +883,10 @@ fn page_shell(
                 // tape strips give a horizontal one.
                 if tape { "0 5mm" } else { "0" }
             ),
-            format!(".sheet.paper {{ grid-template-columns: repeat({}, 1fr); }}", format.columns),
+            format!(
+                ".sheet.paper {{ grid-template-columns: repeat({}, 1fr); }}",
+                format.columns
+            ),
         ),
     };
     let qr = layout.qr_mm;
