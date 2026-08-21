@@ -433,3 +433,54 @@ details.childbox > .list { border-top: 1px solid var(--border); }
 .site-footer strong { color: var(--text); font-weight: 600; }
 .site-footer a { color: var(--muted); text-decoration: underline; }
 .site-footer a:hover { color: var(--link); }
+
+/* ------------------------------------------------------- restock scanning */
+
+.scan-card.restock { border-left: 5px solid var(--ok); }
+.scan-card.restock.down { border-left-color: var(--accent); }
+.restock-head { display: flex; align-items: center; gap: 16px; padding: 16px; flex-wrap: wrap; }
+.restock-delta {
+  font-size: 34px; font-weight: 800; line-height: 1; letter-spacing: -.03em;
+  color: var(--ok); flex: 0 0 auto; font-variant-numeric: tabular-nums;
+}
+.restock.down .restock-delta { color: var(--accent); }
+.restock-what { flex: 1 1 200px; min-width: 0; }
+.restock-name { font-size: 19px; font-weight: 700; line-height: 1.2; }
+.restock-count {
+  display: flex; align-items: baseline; gap: 8px; flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+.restock-count .was { font-size: 17px; color: var(--muted); text-decoration: line-through; }
+.restock-count .arrow { color: var(--muted); }
+.restock-count .now { font-size: 30px; font-weight: 800; letter-spacing: -.02em; }
+.restock-note {
+  font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--danger); margin-left: 4px;
+}
+.restock-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 16px; border-top: 1px solid var(--border);
+  font-size: 12px; color: var(--muted); flex-wrap: wrap;
+}
+
+/* ------------------------------------------------------------ label page */
+
+.label-controls { padding: 14px; }
+.label-layout { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 900px) { .label-layout { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); } }
+
+.label-picker { overflow: hidden; }
+.label-picker-head {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+.label-picker-head .hint { margin-left: auto; }
+
+.label-preview-wrap { display: flex; flex-direction: column; gap: 8px; }
+.label-preview-head { display: flex; align-items: center; gap: 10px; }
+.label-preview-head .hint { margin-right: auto; }
+.preview-frame { padding: 0; overflow: hidden; min-height: 220px; }
+.preview-frame iframe {
+  display: block; width: 100%; height: 60vh; min-height: 260px; border: 0;
+  background: #fff;
+}

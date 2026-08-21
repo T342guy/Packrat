@@ -552,47 +552,175 @@ async function viewBoxes() {
            Add the garage itself first, then the shelves and boxes inside it.</div></div>`}`;
 }
 
-async function viewLabels() {
+/* Everything about labels lives on this page: what to print, how it should
+   look, and what it will look like. It used to hand off to a second page that
+   repeated the same controls, which left you setting the same thing twice and
+   unsure which one counted. The preview is the real renderer in an iframe, so
+   what you see is literally what prints — and printing prints the iframe. */
+const labelSettings = {
+  format: localStorage.getItem('label-format') || 'sheet-large',
+  symbols: localStorage.getItem('label-symbols') || 'auto',
+  tape: localStorage.getItem('label-tape') !== 'off',
+  custom: null,
+};
+let labelSelection = new Set();
+let labelPreviewTimer = null;
+
+function labelPreviewUrl() {
+  const codes = [...labelSelection];
+  if (!codes.length) return null;
+  const params = new URLSearchParams({
+    format: labelSettings.format,
+    symbols: labelSettings.symbols,
+    codes: codes.join(','),
+    embed: '1',
+  });
+  if (!labelSettings.tape) params.set('tape', 'off');
+  if (labelSettings.format === 'custom' && labelSettings.custom) {
+    params.set('w', labelSettings.custom.w);
+    params.set('h', labelSettings.custom.h);
+  }
+  return `/labels?${params}`;
+}
+
+function refreshLabelPreview() {
+  const frame = $('#label-preview');
+  const empty = $('#label-preview-empty');
+  const count = $('#label-count');
+  const printButton = $('#label-print');
+  if (!frame) return;
+
+  const chosen = labelSelection.size;
+  if (count) {
+    count.textContent = chosen
+      ? `${plural(chosen, 'label', 'labels')} selected`
+      : 'Nothing selected yet';
+  }
+  if (printButton) printButton.disabled = chosen === 0;
+
+  const url = labelPreviewUrl();
+  frame.hidden = !url;
+  if (empty) empty.hidden = Boolean(url);
+  if (!url) return;
+
+  // Typing through a long list of boxes should not fetch on every keystroke.
+  clearTimeout(labelPreviewTimer);
+  labelPreviewTimer = setTimeout(() => { frame.src = url; }, 200);
+}
+
+async function viewLabels(params) {
   const formats = await api('/api/label-formats');
-  const saved = localStorage.getItem('label-format') || 'sheet-large';
+  const preselected = (params.get('codes') || '')
+    .split(',')
+    .map((c) => c.trim().toUpperCase())
+    .filter(Boolean);
+  labelSelection = new Set(
+    state.containers.filter((c) => preselected.includes(c.code.toUpperCase())).map((c) => c.code),
+  );
+
+  if (!state.containers.length) {
+    view().innerHTML = `
+      <h1>Print labels</h1>
+      <div class="card"><div class="empty"><strong>Nothing to label yet</strong>
+        Add a box first.</div></div>`;
+    return;
+  }
+
   view().innerHTML = `
     <h1>Print labels</h1>
     <p class="sub">Each label carries a QR code. Scanning it on a phone connected to this
        network opens that box's contents — no unstacking, no opening.</p>
-    ${state.containers.length === 0
-      ? `<div class="card"><div class="empty"><strong>Nothing to label yet</strong>
-           Add a box first.</div></div>`
-      : `<div class="card" style="margin-bottom:14px">
-           <div class="checklist" id="label-list">
-             ${state.containers.map((c) => `
-               <label>
-                 <input type="checkbox" name="code" value="${esc(c.code)}">
-                 <span class="chip code">${esc(c.code)}</span>
-                 <span>${esc(c.path)}</span>
-               </label>`).join('')}
-           </div>
-         </div>
-         <div class="card settings-block" style="padding:12px 14px">
-           <label class="field">Label stock
-             <select id="label-format">
-               ${formats.map((f) => `<option value="${f.id}"${f.id === saved ? ' selected' : ''}
-                 >${esc(f.name)}</option>`).join('')}
-               <option value="custom"${saved === 'custom' ? ' selected' : ''}>Custom size…</option>
-             </select>
-             <span class="hint">DYMO stock prints one label per page at its exact size —
-               pick the LabelWriter in the print dialog, margins none, scale 100%.</span>
-           </label>
-         </div>
-         <div class="actions">
-           <button data-act="label-all">Select all</button>
-           <button data-act="label-none">Clear selection</button>
-           <div style="flex:1 1 auto"></div>
-           <button class="primary" data-act="print-labels">Open printable labels</button>
-         </div>
-         <p class="sub" style="margin-top:12px">Bigger labels list what's inside, so they stay
-            useful even without a phone. QR codes point at
-            <code class="inline">${esc(state.publicUrl)}</code> —
-            change that in <a href="#/settings">Settings</a> if it's wrong.</p>`}`;
+
+    <div class="card settings-block label-controls">
+      <div class="field-row">
+        <label class="field">Label stock
+          <select id="label-format">
+            ${formats.map((f) => `<option value="${f.id}"${f.id === labelSettings.format ? ' selected' : ''}
+              >${esc(f.name)}</option>`).join('')}
+            <option value="custom"${labelSettings.format === 'custom' ? ' selected' : ''}>Custom size…</option>
+          </select>
+        </label>
+        <label class="field">Symbols
+          <select id="label-symbols">
+            ${[['auto', 'Automatic'], ['qr', 'QR code only'],
+               ['both', 'QR code and barcode'], ['barcode', 'Barcode only']]
+              .map(([id, label]) => `<option value="${id}"${id === labelSettings.symbols ? ' selected' : ''}
+                >${label}</option>`).join('')}
+        </select>
+        </label>
+      </div>
+      <label class="checkline" style="margin-top:10px">
+        <input type="checkbox" id="label-tape" ${labelSettings.tape ? 'checked' : ''}>
+        Cut &amp; tape margins on paper sheets
+      </label>
+    </div>
+
+    <div class="label-layout">
+      <div class="card label-picker">
+        <div class="label-picker-head">
+          <button class="tiny" data-act="label-all">Select all</button>
+          <button class="tiny" data-act="label-none">Clear</button>
+          <span class="hint" id="label-count"></span>
+        </div>
+        <div class="checklist" id="label-list">
+          ${state.containers.map((c) => `
+            <label>
+              <input type="checkbox" name="code" value="${esc(c.code)}"
+                     ${labelSelection.has(c.code) ? 'checked' : ''}>
+              <span class="chip code">${esc(c.code)}</span>
+              <span>${esc(c.path)}</span>
+            </label>`).join('')}
+        </div>
+      </div>
+
+      <div class="label-preview-wrap">
+        <div class="label-preview-head">
+          <span class="hint">Preview</span>
+          <button class="primary" id="label-print" data-act="label-print">Print these labels</button>
+        </div>
+        <div class="card preview-frame">
+          <div class="empty" id="label-preview-empty">Tick the boxes you want labels for.</div>
+          <iframe id="label-preview" title="Label preview" hidden></iframe>
+        </div>
+      </div>
+    </div>
+
+    <p class="sub" style="margin-top:14px">QR codes point at
+       <code class="inline">${esc(state.publicUrl)}</code> —
+       change that in <a href="#/settings">Settings</a> if it's wrong.</p>`;
+
+  $('#label-format').addEventListener('change', (event) => {
+    if (event.target.value === 'custom') {
+      const size = prompt('Label size in millimetres, width × height', '25 x 25');
+      const [w, h] = (size || '').split(/[x×,]/).map((n) => parseFloat(n.trim()));
+      if (!w || !h) {
+        event.target.value = labelSettings.format;
+        return;
+      }
+      labelSettings.custom = { w, h };
+    }
+    labelSettings.format = event.target.value;
+    localStorage.setItem('label-format', labelSettings.format);
+    refreshLabelPreview();
+  });
+  $('#label-symbols').addEventListener('change', (event) => {
+    labelSettings.symbols = event.target.value;
+    localStorage.setItem('label-symbols', labelSettings.symbols);
+    refreshLabelPreview();
+  });
+  $('#label-tape').addEventListener('change', (event) => {
+    labelSettings.tape = event.target.checked;
+    localStorage.setItem('label-tape', labelSettings.tape ? 'on' : 'off');
+    refreshLabelPreview();
+  });
+  $('#label-list').addEventListener('change', (event) => {
+    if (event.target.name !== 'code') return;
+    if (event.target.checked) labelSelection.add(event.target.value);
+    else labelSelection.delete(event.target.value);
+    refreshLabelPreview();
+  });
+
+  refreshLabelPreview();
 }
 
 // ------------------------------------------------------------------ scanner
@@ -604,6 +732,7 @@ async function viewLabels() {
 const scanner = {
   mode: 'lookup',
   destination: null,
+  lastChange: null,
   log: [],
   sound: localStorage.getItem('scan-sound') !== 'off',
 };
@@ -724,6 +853,38 @@ function itemResult(item, note) {
     </div>`;
 }
 
+/* Restocking is a rhythm: scan, scan, scan. The card has to answer, at a
+   glance and from arm's length, what was scanned, where it lives, what the
+   scan just did, and what the count is now. */
+function restockResult(item, change) {
+  const { delta, before, after } = change;
+  const sign = delta > 0 ? '+' : '\u2212';
+  const where = item.container_id
+    ? `<a href="#/box/${encodeURIComponent(item.container_code)}">${esc(item.container_path)}</a>`
+    : 'Not in a box yet';
+  const emptied = after === 0 ? '<span class="restock-note">none left</span>' : '';
+  return `
+    <div class="card scan-card restock ${delta > 0 ? 'up' : 'down'}">
+      <div class="restock-head">
+        <span class="restock-delta">${sign}${Math.abs(delta)}</span>
+        <div class="restock-what">
+          <div class="restock-name">${esc(item.name)}</div>
+          <div class="where">${where}</div>
+        </div>
+        <div class="restock-count">
+          <span class="was">${before}</span>
+          <span class="arrow">&rarr;</span>
+          <span class="now">${after}</span>
+          ${emptied}
+        </div>
+      </div>
+      <div class="restock-foot">
+        <span>${esc(SCAN_MODES[scanner.mode].label)}${item.barcode ? ` \u00b7 ${esc(item.barcode)}` : ''}</span>
+        <button class="tiny" data-act="scan-undo">Undo this scan</button>
+      </div>
+    </div>`;
+}
+
 function containerResult(detail, note) {
   const c = detail.container;
   const preview = detail.items.slice(0, 10)
@@ -790,9 +951,16 @@ async function handleScan(code) {
         return;
       }
       if (item.container_id === scanner.destination.id) {
+        const before = item.quantity;
         const updated = await api(`/api/items/${item.id}/quantity`, {
           method: 'POST', body: JSON.stringify({ delta: 1 }),
         });
+        scanner.lastChange = {
+          kind: 'quantity',
+          itemId: item.id,
+          name: item.name,
+          delta: updated.quantity - before,
+        };
         scanLog(`${item.name} already in ${scanner.destination.code} → ${updated.quantity}`, 'move');
         beep('move');
         scanResultCard(itemResult(updated, 'Already in this box, so the count went up.'));
@@ -801,6 +969,13 @@ async function handleScan(code) {
         const moved = await api(`/api/items/${item.id}/move`, {
           method: 'POST', body: JSON.stringify({ container_id: scanner.destination.id }),
         });
+        scanner.lastChange = {
+          kind: 'move',
+          itemId: item.id,
+          name: item.name,
+          previousContainer: item.container_id,
+          from,
+        };
         scanLog(`${item.name}: ${from} → ${scanner.destination.code}`, 'move');
         beep('move');
         scanResultCard(itemResult(moved, `Moved out of ${esc(from)}.`));
@@ -811,14 +986,26 @@ async function handleScan(code) {
 
     if (scanner.mode === 'count' || scanner.mode === 'takeout') {
       const delta = scanner.mode === 'count' ? 1 : -1;
+      const before = item.quantity;
       const updated = await api(`/api/items/${item.id}/quantity`, {
         method: 'POST', body: JSON.stringify({ delta }),
       });
-      const note = updated.quantity === 0 ? 'None left — the entry is still here.' : '';
-      scanLog(`${item.name} ${delta > 0 ? '+1' : '−1'} → ${updated.quantity}`,
+      // Quantity clamps at zero, so the undo has to restore the number rather
+      // than simply flip the sign of the delta.
+      scanner.lastChange = {
+        kind: 'quantity',
+        itemId: item.id,
+        name: item.name,
+        delta: updated.quantity - before,
+      };
+      scanLog(`${item.name} ${delta > 0 ? '+1' : '\u22121'} \u2192 ${updated.quantity}`,
         updated.quantity === 0 ? 'warn' : 'ok');
       beep(updated.quantity === 0 ? 'error' : 'ok');
-      scanResultCard(itemResult(updated, note));
+      scanResultCard(restockResult(updated, {
+        delta: updated.quantity - before,
+        before,
+        after: updated.quantity,
+      }));
       return;
     }
 
@@ -1246,6 +1433,29 @@ const actions = {
     viewScan();
   },
 
+  /** Reverses the last scan that changed something — the mis-scan escape. */
+  'scan-undo': async () => {
+    const change = scanner.lastChange;
+    if (!change) return toast('Nothing to undo', true);
+    if (change.kind === 'quantity') {
+      const restored = await api(`/api/items/${change.itemId}/quantity`, {
+        method: 'POST', body: JSON.stringify({ delta: -change.delta }),
+      });
+      scanLog(`Undid ${change.name}: back to ${restored.quantity}`, 'move');
+      scanResultCard(itemResult(restored, 'Put back the way it was.'));
+    } else {
+      const restored = await api(`/api/items/${change.itemId}/move`, {
+        method: 'POST', body: JSON.stringify({ container_id: change.previousContainer }),
+      });
+      scanLog(`Undid ${change.name}: back in ${change.from}`, 'move');
+      scanResultCard(itemResult(restored, 'Put back the way it was.'));
+    }
+    scanner.lastChange = null;
+    beep('move');
+    await refreshState();
+    focusScanner();
+  },
+
   'scan-clear-destination': () => {
     scanner.destination = null;
     viewScan();
@@ -1296,31 +1506,23 @@ const actions = {
   },
 
   'label-all': () => {
+    labelSelection = new Set(state.containers.map((c) => c.code));
     document.querySelectorAll('#label-list input').forEach((i) => { i.checked = true; });
+    refreshLabelPreview();
   },
 
   'label-none': () => {
+    labelSelection.clear();
     document.querySelectorAll('#label-list input').forEach((i) => { i.checked = false; });
+    refreshLabelPreview();
   },
 
-  'print-labels': () => {
-    const codes = [...document.querySelectorAll('#label-list input:checked')].map((i) => i.value);
-    if (!codes.length) {
-      toast('Tick the boxes you want labels for first', true);
-      return;
-    }
-    const format = $('#label-format').value;
-    localStorage.setItem('label-format', format);
-    const params = new URLSearchParams({ format, codes: codes.join(',') });
-    if (format === 'custom') {
-      const size = prompt('Label size in millimetres, width × height', '25 x 25');
-      if (!size) return;
-      const [w, h] = size.split(/[x×,]/).map((n) => parseFloat(n.trim()));
-      if (!w || !h) return toast('Could not read that size', true);
-      params.set('w', w);
-      params.set('h', h);
-    }
-    window.open(`/labels?${params}`, '_blank', 'noopener');
+  /** Prints the preview iframe, so the paper matches what is on screen. */
+  'label-print': () => {
+    const frame = $('#label-preview');
+    if (!frame || frame.hidden) return toast('Tick the boxes you want labels for first', true);
+    frame.contentWindow.focus();
+    frame.contentWindow.print();
   },
 
   import: () => {
@@ -1422,7 +1624,7 @@ async function render() {
       case 'scan': await viewScan(); break;
       case 'verify': await viewVerify(route.arg); break;
       case 'items': await viewItems(route.params); break;
-      case 'labels': await viewLabels(); break;
+      case 'labels': await viewLabels(route.params); break;
       case 'settings': await viewSettings(); break;
       default: location.hash = '#/';
     }
