@@ -73,6 +73,21 @@ async fn log_requests(request: axum::extract::Request, next: axum::middleware::N
     response
 }
 
+/// Keeps the clock high-water mark moving while the server runs, so a machine
+/// whose clock later jumps backwards can be spotted.
+pub fn spawn_clock_keeper(pool: db::Pool) {
+    tokio::spawn(async move {
+        loop {
+            if let Ok(conn) = pool.get() {
+                if let Err(error) = store::touch_clock(&conn) {
+                    tracing::warn!(%error, "could not record the time");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        }
+    });
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         // Frontend

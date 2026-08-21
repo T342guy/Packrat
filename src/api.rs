@@ -336,6 +336,7 @@ pub async fn health(State(st): State<AppState>) -> AppResult<Json<Value>> {
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
             "containers": containers,
+            "clock": store::clock_status(c)?,
         })))
     })
     .await
@@ -356,6 +357,7 @@ pub async fn bootstrap(State(st): State<AppState>) -> AppResult<Json<Value>> {
             "kinds": store::KINDS,
             "public_url": base_url,
             "stale_after_days": store::stale_after_days(c),
+            "clock": store::clock_status(c)?,
         })))
     })
     .await

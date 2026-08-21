@@ -4,6 +4,7 @@
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 /// Crockford-ish alphabet: no 0/O/1/I/L/U, so codes survive being read off a
@@ -107,6 +108,78 @@ pub fn normalize_code(code: &str) -> String {
     code.trim().to_uppercase().replace(' ', "-")
 }
 
+// --------------------------------------------------------------------- clock
+//
+// Staleness is measured against the operating system's clock, which is the
+// only sense of time a process gets across restarts. That is fine for the
+// ordinary case — stopping Packrat for six months does not hide the six
+// months, because the clock keeps running without it. It is not fine when the
+// clock itself is wrong: a machine with no battery-backed clock can boot in
+// 1970, and a clock that jumps backwards would make everything look freshly
+// checked.
+//
+// So the latest time ever observed is recorded, and time is read as "now, or
+// the high-water mark, whichever is later". A clock that moves backwards then
+// freezes the ages where they were instead of winding them back, and the
+// discrepancy is reported rather than silently absorbed.
+
+const CLOCK_KEY: &str = "clock_high_water";
+/// Small backwards steps are normal — NTP corrections, leap smearing.
+const CLOCK_TOLERANCE_SECONDS: i64 = 120;
+
+#[derive(Debug, Serialize)]
+pub struct ClockStatus {
+    pub now: String,
+    pub high_water: Option<String>,
+    /// How far behind the recorded high-water mark the system clock is, when
+    /// that gap is big enough to matter.
+    pub behind_seconds: Option<i64>,
+}
+
+/// The current time, never earlier than the latest time already seen.
+pub fn trusted_now(conn: &Connection) -> AppResult<String> {
+    Ok(conn.query_row(
+        "SELECT MAX(datetime('now'),
+                    COALESCE((SELECT value FROM settings WHERE key = ?1), datetime('now')))",
+        [CLOCK_KEY],
+        |r| r.get(0),
+    )?)
+}
+
+/// Records that time has reached at least this point.
+pub fn touch_clock(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+        [CLOCK_KEY],
+    )?;
+    Ok(())
+}
+
+pub fn clock_status(conn: &Connection) -> AppResult<ClockStatus> {
+    let (now, high_water): (String, Option<String>) = conn.query_row(
+        "SELECT datetime('now'), (SELECT value FROM settings WHERE key = ?1)",
+        [CLOCK_KEY],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let behind_seconds = match &high_water {
+        Some(mark) => {
+            let gap: i64 = conn.query_row(
+                "SELECT CAST((julianday(?1) - julianday(?2)) * 86400 AS INTEGER)",
+                [mark, &now],
+                |r| r.get(0),
+            )?;
+            (gap > CLOCK_TOLERANCE_SECONDS).then_some(gap)
+        }
+        None => None,
+    };
+    Ok(ClockStatus {
+        now,
+        high_water,
+        behind_seconds,
+    })
+}
+
 // ---------------------------------------------------------------- containers
 
 struct RawContainer {
@@ -121,17 +194,19 @@ struct RawContainer {
     created_at: String,
     updated_at: String,
     checked_at: Option<String>,
-    age_days: i64,
+    age_seconds: i64,
 }
 
 fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
+    let now = trusted_now(conn)?;
     let mut stmt = conn.prepare(
         "SELECT id, code, name, kind, parent_id, notes, photo_id, barcode, created_at, updated_at,
                 checked_at,
-                CAST(julianday('now') - julianday(COALESCE(checked_at, created_at)) AS INTEGER)
+                CAST((julianday(?1) - julianday(COALESCE(checked_at, created_at))) * 86400
+                     AS INTEGER)
          FROM containers",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map([&now], |r| {
         Ok(RawContainer {
             id: r.get(0)?,
             code: r.get(1)?,
@@ -144,7 +219,7 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
             created_at: r.get(8)?,
             updated_at: r.get(9)?,
             checked_at: r.get(10)?,
-            age_days: r.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0),
+            age_seconds: r.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -219,11 +294,13 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
                 created_at: c.created_at.clone(),
                 updated_at: c.updated_at.clone(),
                 checked_at: c.checked_at.clone(),
-                days_since_check: c.checked_at.as_ref().map(|_| c.age_days),
-                age_days: c.age_days,
+                days_since_check: c.checked_at.as_ref().map(|_| c.age_seconds / 86_400),
+                seconds_since_check: c.checked_at.as_ref().map(|_| c.age_seconds),
+                age_days: c.age_seconds / 86_400,
+                age_seconds: c.age_seconds,
                 // Only containers actually holding something can go stale:
                 // an empty shelf has nothing to verify.
-                stale: item_count > 0 && c.age_days > threshold,
+                stale: item_count > 0 && c.age_seconds / 86_400 > threshold,
                 path: names.join(" / "),
                 depth,
                 item_count,
@@ -406,6 +483,7 @@ pub fn delete_container(conn: &mut Connection, id: i64) -> AppResult<()> {
 
 /// Records that someone has just eyeballed this container's contents.
 pub fn mark_checked(conn: &Connection, id: i64) -> AppResult<Container> {
+    touch_clock(conn)?;
     let changed = conn.execute(
         "UPDATE containers SET checked_at = datetime('now') WHERE id = ?1",
         [id],
@@ -1529,6 +1607,65 @@ mod tests {
         let b = with_barcode(&mut conn, "Saw", "", None);
         assert_eq!(a.barcode, None);
         assert_eq!(b.barcode, None);
+    }
+
+    #[test]
+    fn ages_are_reported_in_seconds_not_whole_days() {
+        let conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        conn.execute(
+            "UPDATE containers SET created_at = datetime('now', '-40 minutes') WHERE id = ?1",
+            [bin.id],
+        )
+        .unwrap();
+        let loaded = container_by_id(&conn, bin.id).unwrap();
+        assert_eq!(loaded.age_days, 0, "less than a day old");
+        // Whole days alone cannot tell 40 minutes from 20 hours.
+        assert!(
+            (2350..2450).contains(&loaded.age_seconds),
+            "expected about 2400 seconds, got {}",
+            loaded.age_seconds
+        );
+    }
+
+    #[test]
+    fn a_clock_that_moves_backwards_does_not_refresh_anything() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        item(&mut conn, "Tent", "", Some(bin.id), &[]);
+        conn.execute(
+            "UPDATE containers SET checked_at = datetime('now', '-300 days') WHERE id = ?1",
+            [bin.id],
+        )
+        .unwrap();
+        assert!(container_by_id(&conn, bin.id).unwrap().stale);
+
+        // The machine has seen time run a year past the current clock reading,
+        // as it would after a clock is wound back or a dead RTC resets.
+        crate::db::set_setting(&conn, "clock_high_water", "2099-01-01 00:00:00").unwrap();
+
+        let after = container_by_id(&conn, bin.id).unwrap();
+        assert!(
+            after.stale,
+            "winding the clock back must not clear a check-up"
+        );
+        assert!(
+            after.age_days > 300,
+            "age is measured from the latest time seen, not the earlier clock"
+        );
+
+        let status = clock_status(&conn).unwrap();
+        assert!(
+            status.behind_seconds.unwrap() > 0,
+            "and the discrepancy is reported"
+        );
+    }
+
+    #[test]
+    fn a_normal_clock_reports_no_discrepancy() {
+        let conn = test_db();
+        touch_clock(&conn).unwrap();
+        assert_eq!(clock_status(&conn).unwrap().behind_seconds, None);
     }
 
     #[test]

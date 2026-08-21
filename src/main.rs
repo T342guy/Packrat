@@ -241,6 +241,33 @@ async fn run() -> Result<(), String> {
         public_url_override: Arc::new(RwLock::new(args.public_url.clone().or(stored))),
     };
 
+    // Report a clock that has moved backwards: check-up ages are measured
+    // against it, and a wrong clock would quietly make everything look fresh.
+    {
+        let conn = state.pool.get().map_err(|e| e.to_string())?;
+        match packrat::store::clock_status(&conn) {
+            Ok(status) => {
+                if let Some(behind) = status.behind_seconds {
+                    let days = behind / 86_400;
+                    tracing::warn!(behind_seconds = behind, "system clock is behind");
+                    println!(
+                        "\n  ⚠ This machine's clock reads earlier than the last time Packrat saw\n    \
+                         ({} behind). Check-up ages are held at the later of the two, so nothing\n    \
+                         is wrongly marked fresh — but fixing the clock is worth doing.",
+                        if days > 0 {
+                            format!("about {days} days")
+                        } else {
+                            format!("{} minutes", behind / 60)
+                        }
+                    );
+                }
+            }
+            Err(e) => eprintln!("could not read the clock state: {}", e.message),
+        }
+        let _ = packrat::store::touch_clock(&conn);
+    }
+    packrat::spawn_clock_keeper(state.pool.clone());
+
     let app = router(state.clone());
     let bind: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
