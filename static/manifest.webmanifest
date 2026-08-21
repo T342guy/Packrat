@@ -1,0 +1,11 @@
+{
+  "name": "Garage Inventory",
+  "short_name": "Inventory",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f5f7",
+  "theme_color": "#b45309",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

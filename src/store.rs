@@ -1,0 +1,964 @@
+//! All SQL lives here. Handlers stay thin; this module owns the data model
+//! invariants (label codes, container nesting, tag normalisation).
+
+use crate::error::{AppError, AppResult};
+use crate::models::*;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use std::collections::{HashMap, HashSet};
+
+/// Crockford-ish alphabet: no 0/O/1/I/L/U, so codes survive being read off a
+/// label by a human and typed into the search box.
+const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ";
+const MAX_DEPTH: usize = 64;
+
+pub const KINDS: &[&str] = &["area", "shelf", "cabinet", "drawer", "bin", "box", "bag", "other"];
+
+fn kind_prefix(kind: &str) -> &'static str {
+    match kind {
+        "area" => "AR",
+        "shelf" => "SH",
+        "cabinet" => "CB",
+        "drawer" => "DR",
+        "bin" => "BN",
+        "bag" => "BG",
+        "other" => "CT",
+        _ => "BX",
+    }
+}
+
+pub fn normalize_kind(kind: &str) -> String {
+    let k = kind.trim().to_lowercase();
+    if KINDS.contains(&k.as_str()) {
+        k
+    } else {
+        "box".to_string()
+    }
+}
+
+/// Generates a short, unique, human-readable label code such as `BX-7K3Q`.
+fn generate_code(conn: &Connection, kind: &str) -> AppResult<String> {
+    use rand::Rng;
+    let prefix = kind_prefix(kind);
+    for attempt in 0..40 {
+        let len = if attempt < 30 { 4 } else { 6 };
+        let mut rng = rand::thread_rng();
+        let suffix: String = (0..len)
+            .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
+            .collect();
+        let code = format!("{prefix}-{suffix}");
+        let taken: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM containers WHERE code = ?1)",
+            [&code],
+            |r| r.get(0),
+        )?;
+        if !taken {
+            return Ok(code);
+        }
+    }
+    Err(AppError::internal("could not allocate a unique label code"))
+}
+
+pub fn normalize_code(code: &str) -> String {
+    code.trim().to_uppercase().replace(' ', "-")
+}
+
+// ---------------------------------------------------------------- containers
+
+struct RawContainer {
+    id: i64,
+    code: String,
+    name: String,
+    kind: String,
+    parent_id: Option<i64>,
+    notes: String,
+    photo_id: Option<i64>,
+    created_at: String,
+    updated_at: String,
+}
+
+fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, code, name, kind, parent_id, notes, photo_id, created_at, updated_at
+         FROM containers",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(RawContainer {
+            id: r.get(0)?,
+            code: r.get(1)?,
+            name: r.get(2)?,
+            kind: r.get(3)?,
+            parent_id: r.get(4)?,
+            notes: r.get(5)?,
+            photo_id: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Loads every container, enriched with its full path and content counts.
+/// Containers are few (tens to hundreds even in a very full garage), so doing
+/// the tree work in Rust is simpler and faster than recursive SQL.
+pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
+    let raw = load_raw(conn)?;
+    let by_id: HashMap<i64, usize> = raw.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+
+    let mut direct_items: HashMap<i64, (i64, i64)> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT container_id, COUNT(*), COALESCE(SUM(quantity), 0)
+             FROM items WHERE container_id IS NOT NULL GROUP BY container_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        for row in rows {
+            let (cid, count, qty) = row?;
+            direct_items.insert(cid, (count, qty));
+        }
+    }
+
+    let mut child_counts: HashMap<i64, i64> = HashMap::new();
+    for c in &raw {
+        if let Some(p) = c.parent_id {
+            *child_counts.entry(p).or_insert(0) += 1;
+        }
+    }
+
+    let mut out: Vec<Container> = raw
+        .iter()
+        .map(|c| {
+            // Walk up to the root to build the breadcrumb path, guarding
+            // against cycles that a hand-edited database could contain.
+            let mut names = vec![c.name.clone()];
+            let mut seen = HashSet::from([c.id]);
+            let mut cursor = c.parent_id;
+            while let Some(pid) = cursor {
+                if !seen.insert(pid) || names.len() > MAX_DEPTH {
+                    break;
+                }
+                match by_id.get(&pid) {
+                    Some(&idx) => {
+                        names.push(raw[idx].name.clone());
+                        cursor = raw[idx].parent_id;
+                    }
+                    None => break,
+                }
+            }
+            let depth = names.len() as i64 - 1;
+            names.reverse();
+            let (item_count, total_quantity) = direct_items.get(&c.id).copied().unwrap_or((0, 0));
+            Container {
+                id: c.id,
+                code: c.code.clone(),
+                name: c.name.clone(),
+                kind: c.kind.clone(),
+                parent_id: c.parent_id,
+                notes: c.notes.clone(),
+                photo_id: c.photo_id,
+                created_at: c.created_at.clone(),
+                updated_at: c.updated_at.clone(),
+                path: names.join(" / "),
+                depth,
+                item_count,
+                total_quantity,
+                child_count: child_counts.get(&c.id).copied().unwrap_or(0),
+            }
+        })
+        .collect();
+
+    out.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    Ok(out)
+}
+
+pub fn container_by_id(conn: &Connection, id: i64) -> AppResult<Container> {
+    all_containers(conn)?
+        .into_iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| AppError::not_found(format!("no container with id {id}")))
+}
+
+pub fn container_by_code(conn: &Connection, code: &str) -> AppResult<Container> {
+    let wanted = normalize_code(code);
+    all_containers(conn)?
+        .into_iter()
+        .find(|c| c.code.to_uppercase() == wanted)
+        .ok_or_else(|| AppError::not_found(format!("no container with code {code}")))
+}
+
+/// Ids of `root` and everything nested underneath it.
+pub fn descendant_ids(all: &[Container], root: i64) -> Vec<i64> {
+    let mut ids = vec![root];
+    let mut frontier = vec![root];
+    while let Some(current) = frontier.pop() {
+        for c in all {
+            if c.parent_id == Some(current) && !ids.contains(&c.id) {
+                ids.push(c.id);
+                frontier.push(c.id);
+            }
+        }
+    }
+    ids
+}
+
+fn validate_parent(all: &[Container], id: Option<i64>, parent_id: Option<i64>) -> AppResult<()> {
+    let Some(parent) = parent_id else { return Ok(()) };
+    if !all.iter().any(|c| c.id == parent) {
+        return Err(AppError::bad_request("parent container does not exist"));
+    }
+    if let Some(id) = id {
+        if parent == id {
+            return Err(AppError::bad_request("a container cannot contain itself"));
+        }
+        if descendant_ids(all, id).contains(&parent) {
+            return Err(AppError::bad_request(
+                "cannot move a container inside one of its own contents",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn create_container(conn: &Connection, input: &ContainerInput) -> AppResult<Container> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(AppError::bad_request("name is required"));
+    }
+    let kind = normalize_kind(&input.kind);
+    let all = all_containers(conn)?;
+    validate_parent(&all, None, input.parent_id)?;
+
+    let code = match input.code.as_deref().map(normalize_code) {
+        Some(c) if !c.is_empty() => {
+            if all.iter().any(|x| x.code.to_uppercase() == c) {
+                return Err(AppError::bad_request(format!("label code {c} is already in use")));
+            }
+            c
+        }
+        _ => generate_code(conn, &kind)?,
+    };
+
+    conn.execute(
+        "INSERT INTO containers (code, name, kind, parent_id, notes, photo_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![code, name, kind, input.parent_id, input.notes.trim(), input.photo_id],
+    )?;
+    container_by_id(conn, conn.last_insert_rowid())
+}
+
+pub fn update_container(conn: &Connection, id: i64, input: &ContainerInput) -> AppResult<Container> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(AppError::bad_request("name is required"));
+    }
+    let kind = normalize_kind(&input.kind);
+    let all = all_containers(conn)?;
+    if !all.iter().any(|c| c.id == id) {
+        return Err(AppError::not_found(format!("no container with id {id}")));
+    }
+    validate_parent(&all, Some(id), input.parent_id)?;
+
+    let code = match input.code.as_deref().map(normalize_code) {
+        Some(c) if !c.is_empty() => {
+            if all.iter().any(|x| x.id != id && x.code.to_uppercase() == c) {
+                return Err(AppError::bad_request(format!("label code {c} is already in use")));
+            }
+            c
+        }
+        _ => all.iter().find(|c| c.id == id).map(|c| c.code.clone()).unwrap_or_default(),
+    };
+
+    conn.execute(
+        "UPDATE containers
+            SET code = ?1, name = ?2, kind = ?3, parent_id = ?4, notes = ?5, photo_id = ?6,
+                updated_at = datetime('now')
+          WHERE id = ?7",
+        params![code, name, kind, input.parent_id, input.notes.trim(), input.photo_id, id],
+    )?;
+    container_by_id(conn, id)
+}
+
+/// Deletes a container. Its child containers are lifted up to its parent and
+/// its items become unfiled — deleting a box must never delete belongings.
+pub fn delete_container(conn: &mut Connection, id: i64) -> AppResult<()> {
+    let tx = conn.transaction()?;
+    let parent: Option<i64> = tx
+        .query_row("SELECT parent_id FROM containers WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("no container with id {id}")))?;
+    tx.execute("UPDATE containers SET parent_id = ?1 WHERE parent_id = ?2", params![parent, id])?;
+    tx.execute("UPDATE items SET container_id = NULL WHERE container_id = ?1", [id])?;
+    tx.execute("DELETE FROM containers WHERE id = ?1", [id])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail> {
+    let all = all_containers(conn)?;
+    let container = all
+        .iter()
+        .find(|c| c.id == id)
+        .cloned()
+        .ok_or_else(|| AppError::not_found(format!("no container with id {id}")))?;
+
+    let mut ancestors = Vec::new();
+    let mut cursor = container.parent_id;
+    let mut seen = HashSet::from([id]);
+    while let Some(pid) = cursor {
+        if !seen.insert(pid) {
+            break;
+        }
+        match all.iter().find(|c| c.id == pid) {
+            Some(c) => {
+                ancestors.push(c.clone());
+                cursor = c.parent_id;
+            }
+            None => break,
+        }
+    }
+    ancestors.reverse();
+
+    let children: Vec<Container> =
+        all.iter().filter(|c| c.parent_id == Some(id)).cloned().collect();
+
+    let items = query_items(conn, &ItemQuery { container_id: Some(id), ..Default::default() })?;
+
+    let nested = descendant_ids(&all, id);
+    let (nested_item_count, nested_total_quantity) = all
+        .iter()
+        .filter(|c| nested.contains(&c.id))
+        .fold((0, 0), |(n, q), c| (n + c.item_count, q + c.total_quantity));
+
+    Ok(ContainerDetail {
+        container,
+        ancestors,
+        children,
+        items,
+        nested_item_count,
+        nested_total_quantity,
+    })
+}
+
+// --------------------------------------------------------------------- items
+
+#[derive(Debug, Default)]
+pub struct ItemQuery {
+    pub q: Option<String>,
+    pub container_id: Option<i64>,
+    pub include_nested: bool,
+    pub tag: Option<String>,
+    pub unfiled: bool,
+    pub sort: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// Escapes a user search term for use inside a `LIKE ... ESCAPE '\'` pattern.
+fn like_pattern(term: &str) -> String {
+    let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+fn search_terms(q: &str) -> Vec<String> {
+    q.split_whitespace()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .take(8)
+        .collect()
+}
+
+pub fn query_items(conn: &Connection, query: &ItemQuery) -> AppResult<Vec<Item>> {
+    let mut sql = String::from(
+        "SELECT i.id, i.name, i.description, i.quantity, i.container_id, i.photo_id,
+                i.created_at, i.updated_at, c.code, c.name
+           FROM items i
+           LEFT JOIN containers c ON c.id = i.container_id
+          WHERE 1 = 1",
+    );
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(cid) = query.container_id {
+        if query.include_nested {
+            let all = all_containers(conn)?;
+            let ids = descendant_ids(&all, cid);
+            let placeholders =
+                ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            sql.push_str(&format!(" AND i.container_id IN ({placeholders})"));
+            for id in ids {
+                binds.push(Box::new(id));
+            }
+        } else {
+            sql.push_str(" AND i.container_id = ?");
+            binds.push(Box::new(cid));
+        }
+    }
+    if query.unfiled {
+        sql.push_str(" AND i.container_id IS NULL");
+    }
+    if let Some(tag) = &query.tag {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id
+                           WHERE it.item_id = i.id AND t.name = ? COLLATE NOCASE)",
+        );
+        binds.push(Box::new(tag.trim().to_string()));
+    }
+
+    let terms = query.q.as_deref().map(search_terms).unwrap_or_default();
+    for term in &terms {
+        // Every term must match somewhere: the item, its tags, or the label of
+        // the container it lives in (so "camping BX-7K3Q" narrows correctly).
+        sql.push_str(
+            " AND (i.name LIKE ? ESCAPE '\\' OR i.description LIKE ? ESCAPE '\\'
+                   OR c.name LIKE ? ESCAPE '\\' OR c.code LIKE ? ESCAPE '\\'
+                   OR EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id
+                               WHERE it.item_id = i.id AND t.name LIKE ? ESCAPE '\\'))",
+        );
+        let pattern = like_pattern(term);
+        for _ in 0..5 {
+            binds.push(Box::new(pattern.clone()));
+        }
+    }
+
+    match query.sort.as_deref() {
+        Some("newest") => sql.push_str(" ORDER BY i.created_at DESC, i.id DESC"),
+        Some("updated") => sql.push_str(" ORDER BY i.updated_at DESC, i.id DESC"),
+        Some("quantity") => sql.push_str(" ORDER BY i.quantity DESC, i.name COLLATE NOCASE"),
+        _ => sql.push_str(" ORDER BY i.name COLLATE NOCASE, i.id"),
+    }
+    if let Some(limit) = query.limit {
+        sql.push_str(&format!(" LIMIT {}", limit.clamp(1, 10_000)));
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds.iter().map(|b| b.as_ref())), |r| {
+        Ok(Item {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            description: r.get(2)?,
+            quantity: r.get(3)?,
+            container_id: r.get(4)?,
+            photo_id: r.get(5)?,
+            created_at: r.get(6)?,
+            updated_at: r.get(7)?,
+            tags: Vec::new(),
+            container_code: r.get(8)?,
+            container_name: r.get(9)?,
+            container_path: None,
+        })
+    })?;
+    let mut items: Vec<Item> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    attach_tags(conn, &mut items)?;
+    attach_paths(conn, &mut items)?;
+
+    // Relevance ranking happens in Rust: SQL got us the candidate set, but a
+    // name hit should always outrank a passing mention in a description.
+    if !terms.is_empty() {
+        let mut scored: Vec<(i64, Item)> =
+            items.into_iter().map(|i| (score_item(&i, &terms), i)).collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0).then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+        });
+        items = scored.into_iter().map(|(_, i)| i).collect();
+    }
+    Ok(items)
+}
+
+fn score_item(item: &Item, terms: &[String]) -> i64 {
+    let name = item.name.to_lowercase();
+    let description = item.description.to_lowercase();
+    let tags: Vec<String> = item.tags.iter().map(|t| t.to_lowercase()).collect();
+    let container = format!(
+        "{} {}",
+        item.container_name.clone().unwrap_or_default(),
+        item.container_code.clone().unwrap_or_default()
+    )
+    .to_lowercase();
+
+    let mut score = 0;
+    for term in terms {
+        if name == *term {
+            score += 120;
+        } else if name.starts_with(term) {
+            score += 70;
+        } else if name.split_whitespace().any(|w| w.starts_with(term.as_str())) {
+            score += 55;
+        } else if name.contains(term) {
+            score += 40;
+        }
+        if tags.iter().any(|t| t == term) {
+            score += 35;
+        } else if tags.iter().any(|t| t.contains(term)) {
+            score += 20;
+        }
+        if container.contains(term) {
+            score += 15;
+        }
+        if description.contains(term) {
+            score += 10;
+        }
+    }
+    score
+}
+
+fn attach_tags(conn: &Connection, items: &mut [Item]) -> AppResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT it.item_id, t.name FROM item_tags it
+         JOIN tags t ON t.id = it.tag_id
+         ORDER BY t.name COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (item_id, tag) = row?;
+        map.entry(item_id).or_default().push(tag);
+    }
+    for item in items.iter_mut() {
+        if let Some(tags) = map.remove(&item.id) {
+            item.tags = tags;
+        }
+    }
+    Ok(())
+}
+
+fn attach_paths(conn: &Connection, items: &mut [Item]) -> AppResult<()> {
+    if !items.iter().any(|i| i.container_id.is_some()) {
+        return Ok(());
+    }
+    let paths: HashMap<i64, String> =
+        all_containers(conn)?.into_iter().map(|c| (c.id, c.path)).collect();
+    for item in items.iter_mut() {
+        if let Some(cid) = item.container_id {
+            item.container_path = paths.get(&cid).cloned();
+        }
+    }
+    Ok(())
+}
+
+pub fn item_by_id(conn: &Connection, id: i64) -> AppResult<Item> {
+    let mut items = query_items(conn, &ItemQuery::default())?
+        .into_iter()
+        .filter(|i| i.id == id)
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return Err(AppError::not_found(format!("no item with id {id}")));
+    }
+    Ok(items.remove(0))
+}
+
+pub fn create_item(conn: &mut Connection, input: &ItemInput) -> AppResult<Item> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(AppError::bad_request("name is required"));
+    }
+    if let Some(cid) = input.container_id {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM containers WHERE id = ?1)",
+            [cid],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::bad_request("container does not exist"));
+        }
+    }
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO items (name, description, quantity, container_id, photo_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            name,
+            input.description.trim(),
+            input.quantity.max(0),
+            input.container_id,
+            input.photo_id
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    set_tags(&tx, id, &input.tags)?;
+    tx.commit()?;
+    item_by_id(conn, id)
+}
+
+pub fn update_item(conn: &mut Connection, id: i64, input: &ItemInput) -> AppResult<Item> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(AppError::bad_request("name is required"));
+    }
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE items
+            SET name = ?1, description = ?2, quantity = ?3, container_id = ?4, photo_id = ?5,
+                updated_at = datetime('now')
+          WHERE id = ?6",
+        params![
+            name,
+            input.description.trim(),
+            input.quantity.max(0),
+            input.container_id,
+            input.photo_id,
+            id
+        ],
+    )?;
+    if changed == 0 {
+        return Err(AppError::not_found(format!("no item with id {id}")));
+    }
+    set_tags(&tx, id, &input.tags)?;
+    tx.commit()?;
+    item_by_id(conn, id)
+}
+
+pub fn delete_item(conn: &Connection, id: i64) -> AppResult<()> {
+    let changed = conn.execute("DELETE FROM items WHERE id = ?1", [id])?;
+    if changed == 0 {
+        return Err(AppError::not_found(format!("no item with id {id}")));
+    }
+    prune_tags(conn)?;
+    Ok(())
+}
+
+pub fn move_item(conn: &Connection, id: i64, container_id: Option<i64>) -> AppResult<Item> {
+    if let Some(cid) = container_id {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM containers WHERE id = ?1)",
+            [cid],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::bad_request("container does not exist"));
+        }
+    }
+    let changed = conn.execute(
+        "UPDATE items SET container_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![container_id, id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::not_found(format!("no item with id {id}")));
+    }
+    item_by_id(conn, id)
+}
+
+pub fn adjust_quantity(conn: &Connection, id: i64, delta: i64) -> AppResult<Item> {
+    let changed = conn.execute(
+        "UPDATE items SET quantity = MAX(0, quantity + ?1), updated_at = datetime('now')
+         WHERE id = ?2",
+        params![delta, id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::not_found(format!("no item with id {id}")));
+    }
+    item_by_id(conn, id)
+}
+
+// ---------------------------------------------------------------------- tags
+
+fn set_tags(conn: &Connection, item_id: i64, tags: &[String]) -> AppResult<()> {
+    conn.execute("DELETE FROM item_tags WHERE item_id = ?1", [item_id])?;
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in tags {
+        let tag = raw.trim();
+        if tag.is_empty() || tag.len() > 64 {
+            continue;
+        }
+        if !seen.insert(tag.to_lowercase()) {
+            continue;
+        }
+        conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag])?;
+        let tag_id: i64 =
+            conn.query_row("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE", [tag], |r| {
+                r.get(0)
+            })?;
+        conn.execute(
+            "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
+            params![item_id, tag_id],
+        )?;
+    }
+    prune_tags(conn)?;
+    Ok(())
+}
+
+fn prune_tags(conn: &Connection) -> AppResult<()> {
+    conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM item_tags)", [])?;
+    Ok(())
+}
+
+pub fn all_tags(conn: &Connection) -> AppResult<Vec<TagCount>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name, COUNT(it.item_id) AS n
+           FROM tags t LEFT JOIN item_tags it ON it.tag_id = t.id
+          GROUP BY t.id
+          ORDER BY n DESC, t.name COLLATE NOCASE",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok(TagCount { name: r.get(0)?, item_count: r.get(1)? }))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// --------------------------------------------------------------------- stats
+
+pub fn stats(conn: &Connection) -> AppResult<Stats> {
+    let one = |sql: &str| -> AppResult<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
+    Ok(Stats {
+        items: one("SELECT COUNT(*) FROM items")?,
+        total_quantity: one("SELECT COALESCE(SUM(quantity), 0) FROM items")?,
+        containers: one("SELECT COUNT(*) FROM containers")?,
+        boxes: one("SELECT COUNT(*) FROM containers WHERE kind IN ('box','bin','bag','drawer')")?,
+        tags: one("SELECT COUNT(*) FROM tags")?,
+        photos: one("SELECT COUNT(*) FROM photos")?,
+        unfiled_items: one("SELECT COUNT(*) FROM items WHERE container_id IS NULL")?,
+        empty_containers: one(
+            "SELECT COUNT(*) FROM containers c
+              WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.container_id = c.id)
+                AND NOT EXISTS (SELECT 1 FROM containers x WHERE x.parent_id = c.id)",
+        )?,
+        database_bytes: one(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+        )?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ContainerInput, ItemInput};
+
+    fn test_db() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        conn
+    }
+
+    fn container(conn: &Connection, name: &str, kind: &str, parent: Option<i64>) -> Container {
+        create_container(
+            conn,
+            &ContainerInput {
+                name: name.into(),
+                kind: kind.into(),
+                parent_id: parent,
+                notes: String::new(),
+                photo_id: None,
+                code: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn item(conn: &mut Connection, name: &str, description: &str, container: Option<i64>, tags: &[&str]) -> Item {
+        create_item(
+            conn,
+            &ItemInput {
+                name: name.into(),
+                description: description.into(),
+                quantity: 1,
+                container_id: container,
+                photo_id: None,
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generated_codes_are_prefixed_by_kind_and_unique() {
+        let conn = test_db();
+        let a = container(&conn, "Garage", "area", None);
+        let b = container(&conn, "Bits", "drawer", None);
+        assert!(a.code.starts_with("AR-"), "{}", a.code);
+        assert!(b.code.starts_with("DR-"), "{}", b.code);
+        assert_ne!(a.code, b.code);
+        // The alphabet avoids characters that are misread off a printed label.
+        assert!(!a.code[3..].contains(['0', 'O', '1', 'I', 'L', 'U']));
+    }
+
+    #[test]
+    fn duplicate_codes_are_rejected() {
+        let conn = test_db();
+        let first = container(&conn, "Garage", "area", None);
+        let clash = create_container(
+            &conn,
+            &ContainerInput {
+                name: "Other".into(),
+                kind: "box".into(),
+                parent_id: None,
+                notes: String::new(),
+                photo_id: None,
+                code: Some(first.code.to_lowercase()),
+            },
+        );
+        assert!(clash.is_err(), "codes must be unique regardless of case");
+    }
+
+    #[test]
+    fn nesting_builds_readable_paths() {
+        let conn = test_db();
+        let garage = container(&conn, "Garage", "area", None);
+        let shelf = container(&conn, "North shelves", "shelf", Some(garage.id));
+        let bin = container(&conn, "Camping", "box", Some(shelf.id));
+        let loaded = container_by_id(&conn, bin.id).unwrap();
+        assert_eq!(loaded.path, "Garage / North shelves / Camping");
+        assert_eq!(loaded.depth, 2);
+    }
+
+    #[test]
+    fn a_container_cannot_be_moved_inside_itself() {
+        let conn = test_db();
+        let garage = container(&conn, "Garage", "area", None);
+        let shelf = container(&conn, "Shelf", "shelf", Some(garage.id));
+        let input = ContainerInput {
+            name: "Garage".into(),
+            kind: "area".into(),
+            parent_id: Some(shelf.id),
+            notes: String::new(),
+            photo_id: None,
+            code: None,
+        };
+        assert!(update_container(&conn, garage.id, &input).is_err());
+    }
+
+    #[test]
+    fn deleting_a_container_keeps_its_contents() {
+        let mut conn = test_db();
+        let garage = container(&conn, "Garage", "area", None);
+        let shelf = container(&conn, "Shelf", "shelf", Some(garage.id));
+        let bin = container(&conn, "Bin", "bin", Some(shelf.id));
+        let hammer = item(&mut conn, "Hammer", "", Some(shelf.id), &[]);
+
+        delete_container(&mut conn, shelf.id).unwrap();
+
+        // The bin moves up to the garage rather than being orphaned...
+        assert_eq!(container_by_id(&conn, bin.id).unwrap().parent_id, Some(garage.id));
+        // ...and the item survives, merely unfiled.
+        assert_eq!(item_by_id(&conn, hammer.id).unwrap().container_id, None);
+    }
+
+    #[test]
+    fn search_requires_every_term_to_match() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Camping gear", "box", None);
+        item(&mut conn, "Camping stove", "propane", Some(bin.id), &[]);
+        item(&mut conn, "Hammer", "claw hammer", None, &[]);
+
+        let hits = query_items(
+            &conn,
+            &ItemQuery { q: Some("camping stove".into()), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "Camping stove");
+
+        let none = query_items(
+            &conn,
+            &ItemQuery { q: Some("camping hammer".into()), ..Default::default() },
+        )
+        .unwrap();
+        assert!(none.is_empty(), "terms are ANDed together");
+    }
+
+    #[test]
+    fn search_finds_items_by_the_box_they_live_in() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Holiday decorations", "bin", None);
+        item(&mut conn, "String lights", "", Some(bin.id), &[]);
+
+        let by_name =
+            query_items(&conn, &ItemQuery { q: Some("holiday".into()), ..Default::default() })
+                .unwrap();
+        assert_eq!(by_name.len(), 1);
+
+        let by_code =
+            query_items(&conn, &ItemQuery { q: Some(bin.code.clone()), ..Default::default() })
+                .unwrap();
+        assert_eq!(by_code.len(), 1);
+    }
+
+    #[test]
+    fn name_matches_outrank_description_matches() {
+        let mut conn = test_db();
+        item(&mut conn, "Spare bulbs", "for the drill light", None, &[]);
+        item(&mut conn, "Drill", "cordless", None, &[]);
+
+        let hits =
+            query_items(&conn, &ItemQuery { q: Some("drill".into()), ..Default::default() })
+                .unwrap();
+        assert_eq!(hits[0].name, "Drill", "the item actually called Drill should come first");
+    }
+
+    #[test]
+    fn like_metacharacters_are_treated_literally() {
+        let mut conn = test_db();
+        item(&mut conn, "Sandpaper", "", None, &[]);
+        for query in ["%", "_", "%%"] {
+            let hits =
+                query_items(&conn, &ItemQuery { q: Some(query.into()), ..Default::default() })
+                    .unwrap();
+            assert!(hits.is_empty(), "'{query}' must not act as a wildcard");
+        }
+    }
+
+    #[test]
+    fn tags_are_deduplicated_case_insensitively() {
+        let mut conn = test_db();
+        let saved = item(&mut conn, "Drill", "", None, &["Tools", "tools", " TOOLS "]);
+        assert_eq!(saved.tags.len(), 1);
+        assert_eq!(all_tags(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unused_tags_are_cleaned_up() {
+        let mut conn = test_db();
+        let drill = item(&mut conn, "Drill", "", None, &["tools"]);
+        assert_eq!(all_tags(&conn).unwrap().len(), 1);
+        delete_item(&conn, drill.id).unwrap();
+        assert!(all_tags(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn quantity_never_goes_negative() {
+        let mut conn = test_db();
+        let bulbs = item(&mut conn, "Bulbs", "", None, &[]);
+        let after = adjust_quantity(&conn, bulbs.id, -10).unwrap();
+        assert_eq!(after.quantity, 0);
+    }
+
+    #[test]
+    fn nested_queries_reach_into_child_containers() {
+        let mut conn = test_db();
+        let garage = container(&conn, "Garage", "area", None);
+        let shelf = container(&conn, "Shelf", "shelf", Some(garage.id));
+        item(&mut conn, "Tent", "", Some(shelf.id), &[]);
+
+        let direct = query_items(
+            &conn,
+            &ItemQuery { container_id: Some(garage.id), ..Default::default() },
+        )
+        .unwrap();
+        assert!(direct.is_empty(), "the tent is on the shelf, not loose in the garage");
+
+        let nested = query_items(
+            &conn,
+            &ItemQuery { container_id: Some(garage.id), include_nested: true, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(nested.len(), 1);
+    }
+
+    #[test]
+    fn items_must_be_named() {
+        let mut conn = test_db();
+        let blank = create_item(
+            &mut conn,
+            &ItemInput {
+                name: "   ".into(),
+                description: String::new(),
+                quantity: 1,
+                container_id: None,
+                photo_id: None,
+                tags: vec![],
+            },
+        );
+        assert!(blank.is_err());
+    }
+}
