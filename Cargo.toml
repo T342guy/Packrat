@@ -1,9 +1,9 @@
 [package]
-name = "garage-inventory"
+name = "packrat"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "A small, locally-hostable inventory system for garages, sheds and storage rooms"
+description = "Packrat — a locally-hostable inventory for garages, sheds and storage rooms"
 license = "MIT"
 
 [dependencies]

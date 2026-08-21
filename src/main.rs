@@ -1,10 +1,11 @@
-//! Garage Inventory — a small, locally-hostable inventory server.
+//! Packrat — a small, locally-hostable inventory server.
 //!
 //! Everything lives in one SQLite file and one binary: run it on a machine at
 //! home, open it from any phone or laptop on the same network, and scan the QR
 //! code on a box to see what's inside without opening it.
 
 mod api;
+mod barcode;
 mod backup;
 mod db;
 mod error;
@@ -59,10 +60,10 @@ struct Args {
 }
 
 const HELP: &str = "\
-garage-inventory — a locally-hostable inventory for garages, sheds and storage
+packrat — a locally-hostable inventory for garages, sheds and storage
 
 USAGE:
-    garage-inventory [OPTIONS]
+    packrat [OPTIONS]
 
 OPTIONS:
     -p, --port <PORT>       Port to listen on [default: 8080]
@@ -91,7 +92,7 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("garage-inventory {}", env!("CARGO_PKG_VERSION"));
+                println!("packrat {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-p" | "--port" => {
@@ -112,7 +113,7 @@ fn parse_args() -> Result<Args, String> {
 #[tokio::main]
 async fn main() {
     if let Err(message) = run().await {
-        eprintln!("garage-inventory: {message}");
+        eprintln!("packrat: {message}");
         std::process::exit(1);
     }
 }
@@ -152,8 +153,8 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("cannot bind {bind}: {e}"))?;
 
     let absolute = std::fs::canonicalize(&args.database).unwrap_or(args.database.clone());
-    println!("\n  Garage Inventory");
-    println!("  ────────────────");
+    println!("\n  Packrat");
+    println!("  ───────");
     println!("  database   {}", absolute.display());
     println!("  local      http://localhost:{}", args.port);
     if let Some(ip) = state.lan_ip {
@@ -193,6 +194,8 @@ fn router(state: AppState) -> Router {
         .route("/api/containers/{id}", delete(api::delete_container))
         .route("/api/containers/{id}/qr.svg", get(media::container_qr))
         .route("/api/containers/{id}/verify", post(api::verify_container))
+        .route("/api/containers/{id}/barcode.svg", get(media::container_barcode))
+        .route("/api/scan/{code}", get(api::scan))
         .route("/api/stale", get(api::stale_containers))
         .route("/api/by-code/{code}", get(api::get_container_by_code))
         // Items
@@ -281,6 +284,7 @@ fn seed_example(conn: &mut rusqlite::Connection) -> Result<bool, String> {
             notes: String::new(),
             photo_id: None,
             code: None,
+            barcode: None,
         };
         store::create_container(conn, &input).map(|c| c.id).map_err(|e| e.message)
     };
@@ -311,6 +315,7 @@ fn seed_example(conn: &mut rusqlite::Connection) -> Result<bool, String> {
             container_id: Some(*container),
             photo_id: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            barcode: None,
         };
         store::create_item(conn, &input).map_err(|e| e.message)?;
     }

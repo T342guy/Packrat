@@ -10,6 +10,8 @@ pub struct Container {
     pub parent_id: Option<i64>,
     pub notes: String,
     pub photo_id: Option<i64>,
+    /// A pre-printed barcode stuck on this container, if any.
+    pub barcode: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// When someone last confirmed the contents are still what's listed.
@@ -36,6 +38,8 @@ pub struct Item {
     pub quantity: i64,
     pub container_id: Option<i64>,
     pub photo_id: Option<i64>,
+    /// The product's own barcode (UPC/EAN) or one you assigned it.
+    pub barcode: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub tags: Vec<String>,
@@ -58,6 +62,8 @@ pub struct ContainerInput {
     /// Optional custom label code; generated when absent.
     #[serde(default)]
     pub code: Option<String>,
+    #[serde(default)]
+    pub barcode: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -77,6 +83,8 @@ pub struct ItemInput {
     pub photo_id: Option<i64>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub barcode: Option<String>,
 }
 
 fn default_quantity() -> i64 {
@@ -97,6 +105,15 @@ pub struct QuantityInput {
 pub struct TagCount {
     pub name: String,
     pub item_count: i64,
+}
+
+/// What a scanned code turned out to be.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ScanResult {
+    Container { container: Box<ContainerDetail> },
+    Item { item: Box<Item> },
+    Unknown { code: String },
 }
 
 #[derive(Debug, Serialize)]

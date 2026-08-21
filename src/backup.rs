@@ -82,7 +82,7 @@ pub async fn export_json(
             Vec::new()
         };
         Ok(json!({
-            "format": "garage-inventory",
+            "format": "packrat",
             "version": 1,
             "exported_at": now(c),
             "includes_photos": params.photos,
@@ -100,7 +100,7 @@ pub async fn export_json(
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"garage-inventory-export.json\"",
+            "attachment; filename=\"packrat-export.json\"",
         )
         .body(axum::body::Body::from(body))
         .map_err(|e| AppError::internal(e.to_string()))
@@ -150,7 +150,7 @@ pub async fn export_csv(State(st): State<AppState>) -> AppResult<Response> {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
-        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"garage-inventory.csv\"")
+        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"packrat.csv\"")
         .body(axum::body::Body::from(csv))
         .map_err(|e| AppError::internal(e.to_string()))
 }

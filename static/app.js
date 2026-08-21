@@ -1,4 +1,4 @@
-/* Garage Inventory — single-page frontend. No framework, no build step:
+/* Packrat — single-page frontend. No framework, no build step:
    the whole thing is served from the Rust binary. */
 
 'use strict';
@@ -543,6 +543,244 @@ async function viewLabels() {
             change that in <a href="#/settings">Settings</a> if it's wrong.</p>`}`;
 }
 
+// ------------------------------------------------------------------ scanner
+
+/* Scanner mode assumes a keyboard-wedge barcode scanner: the kind that types
+   what it reads and presses Enter. It keeps one input focused and turns each
+   scan into an action, so a whole box can be put away without touching the
+   keyboard. */
+const scanner = {
+  mode: 'lookup',
+  destination: null,
+  log: [],
+  sound: localStorage.getItem('scan-sound') !== 'off',
+};
+
+const SCAN_MODES = {
+  lookup: { label: 'Look up', hint: 'Scan anything to see what it is and where it lives.' },
+  putaway: {
+    label: 'Put away',
+    hint: 'Scan a box first, then scan items to file them into it.',
+  },
+  count: { label: 'Count +1', hint: 'Each scan adds one to that item\'s quantity.' },
+  takeout: { label: 'Take out −1', hint: 'Each scan takes one away — for things being used up.' },
+};
+
+let audioContext = null;
+function beep(kind) {
+  if (!scanner.sound) return;
+  try {
+    audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    osc.frequency.value = kind === 'error' ? 200 : kind === 'move' ? 660 : 950;
+    gain.gain.value = 0.07;
+    osc.connect(gain);
+    gain.connect(audioContext.destination);
+    osc.start();
+    osc.stop(audioContext.currentTime + (kind === 'error' ? 0.3 : 0.08));
+  } catch { /* no audio available; the on-screen result is enough */ }
+}
+
+function scanLog(text, kind = 'ok') {
+  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  scanner.log.unshift({ time, text, kind });
+  scanner.log = scanner.log.slice(0, 25);
+  const el = $('#scan-log');
+  if (el) el.innerHTML = renderScanLog();
+}
+
+function renderScanLog() {
+  if (!scanner.log.length) return '<div class="empty">Scans will be listed here.</div>';
+  return scanner.log
+    .map((entry) => `<div class="scan-line ${entry.kind}">
+        <span class="t">${entry.time}</span><span>${entry.text}</span></div>`)
+    .join('');
+}
+
+function scanDestinationBar() {
+  if (scanner.mode !== 'putaway') return '';
+  return scanner.destination
+    ? `<div class="destination">Filing into
+         <a href="#/box/${encodeURIComponent(scanner.destination.code)}">
+           <span class="chip code">${esc(scanner.destination.code)}</span>
+           ${esc(scanner.destination.name)}</a>
+         <button class="tiny" data-act="scan-clear-destination">Change</button>
+       </div>`
+    : `<div class="destination empty-destination">Scan a box's label to choose where things go.</div>`;
+}
+
+async function viewScan() {
+  view().innerHTML = `
+    <h1>Scanner</h1>
+    <p class="sub">For a barcode scanner plugged into the machine in the garage. Anything it
+       types lands in the box below — label codes, product barcodes, or typed by hand.</p>
+
+    <div class="scan-modes">
+      ${Object.entries(SCAN_MODES).map(([id, m]) => `
+        <button class="${scanner.mode === id ? 'primary' : ''}" data-act="scan-mode" data-mode="${id}"
+        >${esc(m.label)}</button>`).join('')}
+    </div>
+    <p class="sub">${esc(SCAN_MODES[scanner.mode].hint)}</p>
+    ${scanDestinationBar()}
+
+    <form data-form="scan" class="scan-form" autocomplete="off">
+      <input id="scan-input" name="code" placeholder="Waiting for a scan…" autocomplete="off"
+             autocapitalize="off" spellcheck="false" aria-label="Scanned code">
+      <button class="primary" type="submit">Go</button>
+    </form>
+
+    <div id="scan-result"></div>
+
+    <div class="scan-footer">
+      <h2 style="margin:0">Session</h2>
+      <label class="checkline">
+        <input type="checkbox" data-act="scan-sound" ${scanner.sound ? 'checked' : ''}> Beep on scan
+      </label>
+    </div>
+    <div class="card" id="scan-log">${renderScanLog()}</div>`;
+  focusScanner();
+}
+
+function focusScanner() {
+  const input = $('#scan-input');
+  if (input) input.focus();
+}
+
+function scanResultCard(html) {
+  $('#scan-result').innerHTML = html;
+}
+
+function itemResult(item, note) {
+  return `
+    <div class="card scan-card">
+      ${note ? `<div class="scan-note">${note}</div>` : ''}
+      <div class="row">
+        ${item.photo_id ? `<img class="thumb" src="/photos/${item.photo_id}" alt="">` : ''}
+        <div class="body">
+          <div class="name">${esc(item.name)}</div>
+          <div class="where">${item.container_id
+            ? `In <a href="#/box/${encodeURIComponent(item.container_code)}">${esc(item.container_path)}</a>`
+            : 'Not in a box yet'}</div>
+          ${item.barcode ? `<div class="where">Barcode ${esc(item.barcode)}</div>` : ''}
+        </div>
+        <div class="side">
+          <span class="qty big">${item.quantity}</span>
+          <button class="tiny" data-act="edit-item" data-id="${item.id}">Edit</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function containerResult(detail, note) {
+  const c = detail.container;
+  const preview = detail.items.slice(0, 10)
+    .map((i) => `<li>${esc(i.name)}${i.quantity > 1 ? ` ×${i.quantity}` : ''}</li>`).join('');
+  return `
+    <div class="card scan-card">
+      ${note ? `<div class="scan-note">${note}</div>` : ''}
+      <div style="padding:14px">
+        <span class="chip code">${esc(c.code)}</span>
+        <h3 style="margin:6px 0 2px">${esc(c.name)}</h3>
+        <div class="where">${esc(c.path)} · ${plural(c.item_count, 'item', 'items')}</div>
+        ${detail.items.length ? `<ul class="scan-contents">${preview}</ul>` : ''}
+        ${detail.items.length > 10 ? `<div class="where">+${detail.items.length - 10} more</div>` : ''}
+        <div class="actions" style="margin-top:10px">
+          <a class="btn tiny" href="#/box/${encodeURIComponent(c.code)}">Open box</a>
+          <button class="tiny" data-act="add-item" data-container="${c.id}">+ Add item here</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function unknownResult(code, destination) {
+  return `
+    <div class="card scan-card">
+      <div class="scan-note warn">Nothing in the inventory has the code
+        <strong>${esc(code)}</strong> yet.</div>
+      <div class="actions" style="padding:14px">
+        <button class="primary tiny" data-act="add-item" data-barcode="${esc(code)}"
+                ${destination ? `data-container="${destination.id}"` : ''}>
+          Add it as a new item${destination ? ` in ${esc(destination.code)}` : ''}</button>
+        <button class="tiny" data-act="link-barcode" data-barcode="${esc(code)}">
+          Link it to something already listed</button>
+      </div>
+    </div>`;
+}
+
+/** Turns one scan into whatever the current mode says it means. */
+async function handleScan(code) {
+  const result = await api(`/api/scan/${encodeURIComponent(code)}`);
+
+  if (result.kind === 'container') {
+    const c = result.container.container;
+    if (scanner.mode === 'putaway') {
+      scanner.destination = c;
+      $('#view').querySelector('.destination').outerHTML = scanDestinationBar();
+      scanLog(`Filing into ${c.code} — ${c.name}`, 'move');
+      beep('move');
+      scanResultCard(containerResult(result.container, 'Things scanned from now on go in here.'));
+      return;
+    }
+    scanLog(`${c.code} — ${c.name} (${plural(c.item_count, 'item', 'items')})`);
+    beep('ok');
+    scanResultCard(containerResult(result.container));
+    return;
+  }
+
+  if (result.kind === 'item') {
+    const item = result.item;
+    if (scanner.mode === 'putaway') {
+      if (!scanner.destination) {
+        beep('error');
+        scanLog(`${item.name}: scan a box first to say where it goes`, 'error');
+        scanResultCard(itemResult(item, 'Scan a box label first — that sets where things go.'));
+        return;
+      }
+      if (item.container_id === scanner.destination.id) {
+        const updated = await api(`/api/items/${item.id}/quantity`, {
+          method: 'POST', body: JSON.stringify({ delta: 1 }),
+        });
+        scanLog(`${item.name} already in ${scanner.destination.code} → ${updated.quantity}`, 'move');
+        beep('move');
+        scanResultCard(itemResult(updated, 'Already in this box, so the count went up.'));
+      } else {
+        const from = item.container_path || 'nowhere';
+        const moved = await api(`/api/items/${item.id}/move`, {
+          method: 'POST', body: JSON.stringify({ container_id: scanner.destination.id }),
+        });
+        scanLog(`${item.name}: ${from} → ${scanner.destination.code}`, 'move');
+        beep('move');
+        scanResultCard(itemResult(moved, `Moved out of ${esc(from)}.`));
+      }
+      await refreshState();
+      return;
+    }
+
+    if (scanner.mode === 'count' || scanner.mode === 'takeout') {
+      const delta = scanner.mode === 'count' ? 1 : -1;
+      const updated = await api(`/api/items/${item.id}/quantity`, {
+        method: 'POST', body: JSON.stringify({ delta }),
+      });
+      const note = updated.quantity === 0 ? 'None left — the entry is still here.' : '';
+      scanLog(`${item.name} ${delta > 0 ? '+1' : '−1'} → ${updated.quantity}`,
+        updated.quantity === 0 ? 'warn' : 'ok');
+      beep(updated.quantity === 0 ? 'error' : 'ok');
+      scanResultCard(itemResult(updated, note));
+      return;
+    }
+
+    scanLog(`${item.name} — ${item.container_path || 'not in a box'}`);
+    beep('ok');
+    scanResultCard(itemResult(item));
+    return;
+  }
+
+  beep('error');
+  scanLog(`Unknown code ${result.code}`, 'warn');
+  scanResultCard(unknownResult(result.code, scanner.destination));
+}
+
 async function viewSettings() {
   const settings = await api('/api/settings');
   const s = state.stats;
@@ -691,6 +929,7 @@ function itemModal(item, defaults = {}) {
     container_id: defaults.container_id ?? null,
     photo_id: null,
     tags: [],
+    barcode: defaults.barcode || '',
   };
   openModal(`
     <h3>${isNew ? 'Add an item' : 'Edit item'}</h3>
@@ -722,6 +961,12 @@ function itemModal(item, defaults = {}) {
       <datalist id="tag-suggestions">
         ${state.tags.map((t) => `<option value="${esc(t.name)}">`).join('')}
       </datalist>
+      <label class="field">Barcode
+        <input name="barcode" autocomplete="off" value="${esc(data.barcode || '')}"
+               placeholder="Scan or type a product barcode">
+        <span class="hint">Optional. Scanning this code anywhere in the app jumps straight
+          to this item.</span>
+      </label>
       ${photoField(data.photo_id)}
       <div class="modal-actions">
         ${isNew ? '' : `<button type="button" class="danger" data-act="del-item"
@@ -737,7 +982,7 @@ function containerModal(container, defaults = {}) {
   const isNew = !container;
   const data = container || {
     name: '', kind: 'box', parent_id: defaults.parent_id ?? null,
-    notes: '', photo_id: null, code: '',
+    notes: '', photo_id: null, code: '', barcode: '',
   };
   openModal(`
     <h3>${isNew ? 'Add a box or place' : 'Edit container'}</h3>
@@ -767,6 +1012,12 @@ function containerModal(container, defaults = {}) {
         <input name="code" value="${esc(data.code)}" autocomplete="off">
         <span class="hint">Printed on the label and encoded in its QR code. Changing it means
           reprinting the label.</span>
+      </label>
+      <label class="field">Pre-printed barcode
+        <input name="barcode" autocomplete="off" value="${esc(data.barcode || '')}"
+               placeholder="Only if the box already wears a barcode label">
+        <span class="hint">Optional. Use this if the box already has a barcode sticker you'd
+          rather scan than replace.</span>
       </label>`}
       ${photoField(data.photo_id)}
       <div class="modal-actions">
@@ -797,6 +1048,7 @@ async function submitItem(form) {
     quantity: Number(fd.get('quantity') || 1),
     container_id: fd.get('container_id') ? Number(fd.get('container_id')) : null,
     tags: String(fd.get('tags') || '').split(',').map((t) => t.trim()).filter(Boolean),
+    barcode: fd.get('barcode') || null,
     photo_id: await resolvePhotoId(form),
   };
   const saved = await api(id ? `/api/items/${id}` : '/api/items', {
@@ -817,6 +1069,7 @@ async function submitContainer(form) {
     parent_id: fd.get('parent_id') ? Number(fd.get('parent_id')) : null,
     notes: fd.get('notes') || '',
     code: fd.get('code') || null,
+    barcode: fd.get('barcode') || null,
     photo_id: await resolvePhotoId(form),
   };
   const saved = await api(id ? `/api/containers/${id}` : '/api/containers', {
@@ -853,6 +1106,7 @@ const actions = {
   'add-item': (el) => itemModal(null, {
     container_id: el.dataset.container || currentContainerId(),
     name: el.dataset.name,
+    barcode: el.dataset.barcode,
   }),
 
   'edit-item': async (el) => {
@@ -933,6 +1187,50 @@ const actions = {
     await api(`/api/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
     toast('Tag removed');
     await reload();
+  },
+
+  'scan-mode': (el) => {
+    scanner.mode = el.dataset.mode;
+    viewScan();
+  },
+
+  'scan-clear-destination': () => {
+    scanner.destination = null;
+    viewScan();
+  },
+
+  'scan-sound': (el) => {
+    scanner.sound = el.checked;
+    localStorage.setItem('scan-sound', el.checked ? 'on' : 'off');
+    if (el.checked) beep('ok');
+  },
+
+  /** Attach a scanned barcode to an item that's already in the inventory. */
+  'link-barcode': async (el) => {
+    const barcode = el.dataset.barcode;
+    const query = prompt('Which item should this barcode belong to? Type part of its name:');
+    if (!query) return;
+    const matches = await api(`/api/items?q=${encodeURIComponent(query)}&limit=10`);
+    if (!matches.length) return toast(`Nothing matches “${query}”`, true);
+    const chosen = matches.length === 1
+      ? matches[0]
+      : matches[Number(prompt(`Which one?\n${matches.map((m, i) => `${i + 1}. ${m.name}`).join('\n')}`, '1')) - 1];
+    if (!chosen) return;
+    await api(`/api/items/${chosen.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        name: chosen.name,
+        description: chosen.description,
+        quantity: chosen.quantity,
+        container_id: chosen.container_id,
+        photo_id: chosen.photo_id,
+        tags: chosen.tags,
+        barcode,
+      }),
+    });
+    toast(`${barcode} now points at ${chosen.name}`);
+    scanLog(`Linked ${barcode} → ${chosen.name}`, 'move');
+    scanResultCard(itemResult(await api(`/api/items/${chosen.id}`), 'Barcode linked.'));
   },
 
   'clear-photo': (el) => {
@@ -1039,7 +1337,7 @@ async function render() {
     searchInput.value = '';
   }
   $('#search-clear').hidden = !searchInput.value;
-  $('#fab').hidden = ['settings', 'labels', 'verify', 'review'].includes(route.name);
+  $('#fab').hidden = ['settings', 'labels', 'verify', 'review', 'scan'].includes(route.name);
 
   try {
     switch (route.name) {
@@ -1048,6 +1346,7 @@ async function render() {
       case 'box': await viewBox(route.arg); break;
       case 'boxes': await viewBoxes(); break;
       case 'review': await viewReview(); break;
+      case 'scan': await viewScan(); break;
       case 'verify': await viewVerify(route.arg); break;
       case 'items': await viewItems(route.params); break;
       case 'labels': await viewLabels(); break;
@@ -1096,6 +1395,14 @@ document.addEventListener('submit', async (event) => {
   const submitButton = form.querySelector('button[type=submit]');
   if (submitButton) submitButton.disabled = true;
   try {
+    if (kind === 'scan') {
+      const input = $('#scan-input');
+      const code = input.value.trim();
+      input.value = '';
+      if (code) await handleScan(code);
+      focusScanner();
+      return;
+    }
     if (kind === 'item') await submitItem(form);
     else if (kind === 'container') await submitContainer(form);
     else if (kind === 'settings') await submitSettings(form);
@@ -1127,6 +1434,15 @@ document.addEventListener('change', async (event) => {
     }
     location.hash = `#/items?${params}`;
   }
+});
+
+// A keyboard-wedge scanner types into whatever has focus, so scanner mode
+// pulls focus back whenever the page is clicked.
+document.addEventListener('click', (event) => {
+  if (parseRoute().name !== 'scan') return;
+  if ($('#modal-root').innerHTML) return;
+  if (event.target.closest('input, select, textarea, button, a')) return;
+  focusScanner();
 });
 
 document.addEventListener('keydown', (event) => {

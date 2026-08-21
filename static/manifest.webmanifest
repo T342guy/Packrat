@@ -1,6 +1,6 @@
 {
-  "name": "Garage Inventory",
-  "short_name": "Inventory",
+  "name": "Packrat",
+  "short_name": "Packrat",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f4f5f7",

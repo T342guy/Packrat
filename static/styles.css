@@ -1,4 +1,4 @@
-/* Garage Inventory — mobile-first, no build step, no external assets. */
+/* Packrat — mobile-first, no build step, no external assets. */
 
 :root {
   --bg: #f4f5f7;
@@ -369,3 +369,44 @@ details.childbox > .list { border-top: 1px solid var(--border); }
 }
 .tagrow:last-child { border-bottom: 0; }
 .tagrow .spacer { flex: 1 1 auto; }
+
+/* ---------------------------------------------------------- scanner mode */
+
+.scan-modes { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.scan-modes button { flex: 1 1 auto; justify-content: center; }
+
+.destination {
+  padding: 10px 14px; border-radius: var(--radius); background: var(--surface);
+  border: 1px solid var(--border); margin-bottom: 10px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px;
+}
+.destination.empty-destination { color: var(--muted); border-style: dashed; }
+
+.scan-form { display: flex; gap: 8px; margin-bottom: 14px; }
+.scan-form input {
+  flex: 1 1 auto; min-width: 0; font: 600 18px ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .5px; padding: 14px; border-radius: 10px;
+  border: 2px solid var(--accent); background: var(--surface); color: var(--text);
+}
+.scan-form input:focus { outline: 3px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+
+.scan-card { margin-bottom: 16px; overflow: hidden; }
+.scan-note { padding: 10px 14px; background: var(--surface-2); font-size: 14px; }
+.scan-note.warn { background: #fdecc8; color: #8a5300; }
+@media (prefers-color-scheme: dark) { .scan-note.warn { background: #4a3410; color: #f0b95c; } }
+.scan-contents { margin: 8px 0 0; padding-left: 20px; font-size: 14px; color: var(--muted); }
+.qty.big { font-size: 22px; }
+
+.scan-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+               margin: 22px 0 10px; }
+.scan-line {
+  display: flex; gap: 10px; padding: 7px 14px; font-size: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.scan-line:last-child { border-bottom: 0; }
+.scan-line .t {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  color: var(--muted); flex: 0 0 auto;
+}
+.scan-line.move { color: var(--ok); }
+.scan-line.warn, .scan-line.error { color: var(--danger); }

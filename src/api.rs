@@ -189,6 +189,12 @@ pub async fn bulk_move(
     .await
 }
 
+/// Resolves a scanned barcode or label code to whatever it identifies. This is
+/// the endpoint a barcode scanner drives: everything else follows from it.
+pub async fn scan(State(st): State<AppState>, Path(code): Path<String>) -> AppResult<Json<ScanResult>> {
+    db::run(&st.pool, move |c| store::resolve_scan(c, &code)).await.map(Json)
+}
+
 // ------------------------------------------------------------ search & meta
 
 #[derive(Debug, Deserialize)]

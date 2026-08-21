@@ -112,6 +112,26 @@ fn qr_svg(data: &str, size: u32) -> AppResult<String> {
         .build())
 }
 
+/// The barcode printed on a container's label: a pre-printed one if it has
+/// been assigned, otherwise the container's own label code.
+fn scannable_code(container: &crate::models::Container) -> String {
+    container.barcode.clone().unwrap_or_else(|| container.code.clone())
+}
+
+pub async fn container_barcode(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Response> {
+    let container = db::run(&st.pool, move |c| store::container_by_id(c, id)).await?;
+    let svg = crate::barcode::code128_svg(&scannable_code(&container), 30)
+        .map_err(AppError::bad_request)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/svg+xml")
+        .body(Body::from(svg))
+        .map_err(|e| AppError::internal(e.to_string()))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct QrParams {
     pub size: Option<u32>,
@@ -280,6 +300,8 @@ pub struct LabelParams {
     /// Custom label width/height in millimetres.
     pub w: Option<f32>,
     pub h: Option<f32>,
+    /// `auto` (default), `qr`, `barcode` or `both`.
+    pub symbols: Option<String>,
 }
 
 pub fn escape_html(s: &str) -> String {
@@ -337,7 +359,37 @@ pub async fn print_labels(
         c.split(',').map(store::normalize_code).filter(|s| !s.is_empty()).collect()
     });
 
-    let max_items = format.max_items;
+    // A Code 128 symbol needs roughly half a millimetre per module to survive a
+    // cheap laser scanner; below that width the barcode is printed but likely
+    // unreadable, so `auto` leaves it off.
+    let label_width = format.page_mm.map(|(w, _)| w).unwrap_or(90.0);
+    let symbols = params.symbols.as_deref().unwrap_or("auto");
+    let want_qr = matches!(symbols, "auto" | "qr" | "both");
+    let want_barcode = match symbols {
+        "barcode" | "both" => true,
+        "auto" => label_width >= 48.0,
+        _ => false,
+    };
+
+    // A barcode block (bars plus its caption) is about 11 mm tall. On fixed
+    // height stock that space has to come from somewhere: shrink the QR, and
+    // list fewer items, rather than letting content spill off the label.
+    const BARCODE_BLOCK_MM: f32 = 11.0;
+    let label_height = format.page_mm.map(|(_, h)| h);
+    let qr_mm = match (want_barcode, label_height) {
+        (true, Some(h)) => (h - 3.2 - BARCODE_BLOCK_MM - 1.0).clamp(12.0, format.qr_mm),
+        _ => format.qr_mm,
+    };
+    // Below 40 mm of height the barcode leaves no room for a contents list;
+    // half a clipped line looks broken, so drop the list rather than crop it.
+    let max_items = match (want_barcode, label_height) {
+        (true, Some(h)) if h < 40.0 => 0,
+        _ => format.max_items,
+    };
+    // Same reasoning for the parent location: on a crowded label the code and
+    // the name are what matter.
+    let show_location = format.show_location
+        && !matches!((want_barcode, label_height), (true, Some(h)) if h < 40.0);
     let containers = db::run(&st.pool, {
         let wanted = wanted.clone();
         move |c| {
@@ -373,13 +425,22 @@ pub async fn print_labels(
         return Ok(Html(page_shell(
             "No labels",
             format,
+            format.qr_mm,
             "<p class=\"empty\">No containers matched. Add a box first, then print its label.</p>"
                 .into(),
         )));
     }
 
     let mut body = String::new();
-    body.push_str(&toolbar(format));
+    // Report the narrowest bar this print will actually produce, so the choice
+    // of label stock can be judged rather than guessed at.
+    let widest_code = containers
+        .iter()
+        .filter_map(|(c, _)| crate::barcode::code128_modules(&scannable_code(c)).ok())
+        .max()
+        .unwrap_or(132);
+    let module_mm = (label_width - 3.2) / widest_code as f32;
+    body.push_str(&toolbar(format, symbols, want_barcode, module_mm));
     body.push_str(&format!(
         "<div class=\"sheet {}\">",
         if format.page_mm.is_some() { "roll" } else { "paper" }
@@ -387,7 +448,22 @@ pub async fn print_labels(
 
     for (container, items) in &containers {
         let url = format!("{}/b/{}", base, container.code);
-        let qr = qr_svg(&url, (format.qr_mm * 8.0) as u32)?;
+        let qr = if want_qr {
+            format!("<div class=\"qr\">{}</div>", qr_svg(&url, (qr_mm * 8.0) as u32)?)
+        } else {
+            String::new()
+        };
+        let barcode = if want_barcode {
+            match crate::barcode::code128_svg(&scannable_code(container), 26) {
+                Ok(svg) => format!(
+                    "<div class=\"barcode\">{svg}<span>{}</span></div>",
+                    escape_html(&scannable_code(container))
+                ),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
 
         let contents = if format.show_contents && !items.is_empty() {
             let lis: String = items
@@ -414,7 +490,7 @@ pub async fn print_labels(
             String::new()
         };
 
-        let location = if format.show_location && container.path.contains(" / ") {
+        let location = if show_location && container.path.contains(" / ") {
             let parent = container
                 .path
                 .rsplit_once(" / ")
@@ -431,28 +507,33 @@ pub async fn print_labels(
         };
 
         body.push_str(&format!(
-            r#"<div class="label{stacked}">
-                 <div class="qr">{qr}</div>
-                 <div class="meta">
-                   <div class="code">{code}</div>
-                   {name}
-                   {location}
-                   {contents}
+            r#"<div class="label{stacked}{barcode_only}">
+                 <div class="label-main">
+                   {qr}
+                   <div class="meta">
+                     <div class="code">{code}</div>
+                     {name}
+                     {location}
+                     {contents}
+                   </div>
                  </div>
+                 {barcode}
                </div>"#,
             stacked = if format.stacked { " stacked" } else { "" },
+            barcode_only = if want_barcode && !want_qr { " barcode-only" } else { "" },
             qr = qr,
             code = escape_html(&container.code),
             name = name,
             location = location,
             contents = contents,
+            barcode = barcode,
         ));
     }
     body.push_str("</div>");
-    Ok(Html(page_shell("Labels", format, body)))
+    Ok(Html(page_shell("Labels", format, qr_mm, body)))
 }
 
-fn toolbar(format: &LabelFormat) -> String {
+fn toolbar(format: &LabelFormat, symbols: &str, want_barcode: bool, module_mm: f32) -> String {
     let options: String = LABEL_FORMATS
         .iter()
         .map(|f| {
@@ -476,14 +557,46 @@ fn toolbar(format: &LabelFormat) -> String {
          per box.</p>"
             .to_string()
     };
+    let symbol_options: String = [
+        ("auto", "Automatic"),
+        ("qr", "QR code only"),
+        ("both", "QR code and barcode"),
+        ("barcode", "Barcode only"),
+    ]
+    .iter()
+    .map(|(id, label)| {
+        format!(
+            "<option value=\"{id}\"{}>{label}</option>",
+            if *id == symbols { " selected" } else { "" }
+        )
+    })
+    .collect();
+    let barcode_warning = if want_barcode && module_mm < 0.3 {
+        format!(
+            "<p class=\"help warn\">⚠ On this label the barcode's narrowest bar works out at \
+             {module_mm:.2} mm. Laser scanners generally need 0.3 mm or more — use wider label \
+             stock, or print QR only and pair it with a 2D imaging scanner.</p>"
+        )
+    } else if want_barcode {
+        format!(
+            "<p class=\"help\">Barcode bars print at {module_mm:.2} mm wide here, which any \
+             1D laser scanner should read.</p>"
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"<div class="toolbar no-print">
              <button onclick="window.print()">Print</button>
              <label class="pick">Label stock
                <select id="format">{options}<option value="custom"{custom}>Custom size…</option></select>
              </label>
+             <label class="pick">Symbols
+               <select id="symbols">{symbol_options}</select>
+             </label>
              <a href="/#/labels">Back to the app</a>
            </div>
+           {barcode_warning}
            {roll_help}
            <script>
              document.getElementById('format').addEventListener('change', (e) => {{
@@ -506,15 +619,16 @@ fn toolbar(format: &LabelFormat) -> String {
     )
 }
 
-fn page_shell(title: &str, format: &LabelFormat, body: String) -> String {
+fn page_shell(title: &str, format: &LabelFormat, qr_mm: f32, body: String) -> String {
     // Roll stock prints one label per page at the exact label size; sheet
     // stock tiles labels onto whatever paper the printer holds.
     let (page_rule, label_rule, sheet_rule) = match format.page_mm {
         Some((w, h)) => (
             format!("@page {{ size: {w}mm {h}mm; margin: 0; }}"),
             format!(
-                ".label {{ width: {w}mm; height: {h}mm; padding: 1.6mm; gap: 1.6mm;
+                ".label {{ width: {w}mm; height: {h}mm; padding: 1.6mm; gap: 1.2mm;
                           border-radius: 0; overflow: hidden; }}
+                 .label-main {{ gap: 1.6mm; }}
                  @media print {{ .label {{ break-after: page; page-break-after: always;
                                           border: 0; }} }}"
             ),
@@ -527,13 +641,13 @@ fn page_shell(title: &str, format: &LabelFormat, body: String) -> String {
             format!(".sheet.paper {{ grid-template-columns: repeat({}, 1fr); }}", format.columns),
         ),
     };
-    let qr = format.qr_mm;
+    let qr = qr_mm;
     format!(
         r#"<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · Garage Inventory</title>
+<title>{title} · Packrat</title>
 <style>
   * {{ box-sizing: border-box; }}
   body {{ font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -549,9 +663,13 @@ fn page_shell(title: &str, format: &LabelFormat, body: String) -> String {
   .empty {{ color: #666; }}
   .sheet {{ display: grid; gap: 10px; }}
   {sheet_rule}
-  .label {{ display: flex; border: 1px dashed #bbb; border-radius: 8px; background: #fff;
-            break-inside: avoid; page-break-inside: avoid; align-items: flex-start; }}
-  .label.stacked {{ flex-direction: column; align-items: center; text-align: center; gap: .8mm; }}
+  .label {{ display: flex; flex-direction: column; border: 1px dashed #bbb; border-radius: 8px;
+            background: #fff; break-inside: avoid; page-break-inside: avoid; }}
+  /* The barcode sits under the QR/text row so it can use the label's full
+     width — bars any narrower than about 0.3 mm stop scanning reliably. */
+  .label-main {{ display: flex; align-items: flex-start; gap: inherit; flex: 1 1 auto;
+                 min-height: 0; width: 100%; overflow: hidden; }}
+  .label.stacked .label-main {{ flex-direction: column; align-items: center; text-align: center; }}
   {label_rule}
   {page_rule}
   .label .qr {{ flex: 0 0 auto; }}
@@ -572,6 +690,12 @@ fn page_shell(title: &str, format: &LabelFormat, body: String) -> String {
   .contents li {{ margin: .2mm 0; }}
   .contents .qty {{ color: #555; }}
   .contents .more {{ color: #777; font-style: italic; list-style: none; margin-left: -4mm; }}
+  .barcode {{ margin-top: 1.2mm; width: 100%; }}
+  .barcode svg {{ display: block; width: 100%; height: 7mm; }}
+  .label.barcode-only .barcode svg {{ height: 12mm; }}
+  .barcode span {{ display: block; font: 700 7pt ui-monospace, SFMono-Regular, Menlo, monospace;
+                   letter-spacing: .5px; text-align: center; }}
+  .help.warn {{ color: #8a5300; }}
   @media print {{
     body {{ background: #fff; padding: 0; }}
     .no-print, .help {{ display: none !important; }}

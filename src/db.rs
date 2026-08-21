@@ -102,6 +102,23 @@ pub(crate) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
     }
+
+    if version < 3 {
+        // Optional external barcodes: a product's own UPC/EAN on an item, or a
+        // pre-printed barcode label stuck on a box. Unique where present, so a
+        // scan always resolves to one thing.
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE items ADD COLUMN barcode TEXT;
+             ALTER TABLE containers ADD COLUMN barcode TEXT;
+             CREATE UNIQUE INDEX idx_items_barcode ON items(barcode)
+                 WHERE barcode IS NOT NULL AND barcode <> '';
+             CREATE UNIQUE INDEX idx_containers_barcode ON containers(barcode)
+                 WHERE barcode IS NOT NULL AND barcode <> '';",
+        )?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 

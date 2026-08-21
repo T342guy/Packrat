@@ -1,12 +1,14 @@
-# Garage Inventory
+# Packrat
 
-A small, self-hosted inventory for a garage, shed, basement or storage unit.
+A small, self-hosted inventory for a garage, shed, basement or storage unit —
+for everyone whose storage has quietly outgrown their memory of it.
 One Rust binary, one SQLite file, no cloud account and no internet connection
 required.
 
 The point of it: **know what you own, find it in seconds, and see inside a box
-without opening it.** Every box gets a printed label with a QR code — scan it
-with any phone on your network and its contents open on screen.
+without opening it.** Every box gets a printed label with a QR code and a
+barcode — scan it with a phone or a barcode scanner and its contents open on
+screen.
 
 ## Quick start
 
@@ -18,8 +20,8 @@ Then open <http://localhost:8080>, or the `http://<your-ip>:8080` address the
 server prints, from a phone on the same network.
 
 ```
-  Garage Inventory
-  ────────────────
+  Packrat
+  ───────
   database   /home/you/inventory.db
   local      http://localhost:8080
   network    http://192.168.1.24:8080   ← open this on your phone
@@ -39,7 +41,7 @@ server prints, from a phone on the same network.
 For a build you can copy anywhere:
 
 ```bash
-cargo build --release      # ./target/release/garage-inventory, ~6 MB, no runtime deps
+cargo build --release      # ./target/release/packrat, ~4 MB, no runtime deps
 ```
 
 The frontend is compiled into the binary, so that one file plus your `.db` is
@@ -77,6 +79,39 @@ that box was last verified.
    `http://<server>/b/BX-7K3Q`, which redirects to that box's page — a full,
    current list of the contents, with photos.
 
+### Barcode scanners
+
+Packrat has a **Scanner** mode built for a keyboard-wedge barcode scanner — the
+usual kind, wired or wireless, that types what it reads and presses Enter. Point
+a browser on the garage machine at `#/scan`, and every scan becomes an action.
+It works with a plain keyboard too, so you can try it before buying anything.
+
+Four modes:
+
+| Mode | A scan does this |
+| --- | --- |
+| **Look up** | Shows what the code is and where it lives — a box with its contents, or an item with its location. |
+| **Put away** | Scan a box first to set the destination, then scan items to file them into it. Scanning something already in that box adds one to the count instead. |
+| **Count +1** | Adds one to the item's quantity — for restocking. |
+| **Take out −1** | Takes one away, for things being used up. |
+
+Everything scanned is listed in a running session log, and each scan beeps
+(different tones for found, moved and unknown) so you can work with your eyes on
+the shelves. Scan a code Packrat has never seen and it offers to add it as a new
+item — into the current destination box, with the barcode already filled in — or
+to link it to something already listed.
+
+Items and containers each have an optional **barcode** field, filled in by
+scanning into it. Use a product's own UPC/EAN on an item, or, if a box already
+wears a barcode sticker you'd rather not replace, put that on the container. A
+barcode can only point at one thing, so a scan is never ambiguous.
+
+**About scanner hardware:** cheap 1D laser scanners cannot read QR codes at all
+— they only read linear barcodes. That's why labels can carry both. If you're
+buying, a 2D imaging scanner reads both kinds and is worth the small extra cost;
+if you already own a 1D laser, print labels with the barcode included and use
+stock at least 48 mm wide.
+
 ### Label stock, including DYMO printers
 
 The print page lays labels out for the stock you choose. DYMO (and other
@@ -94,9 +129,18 @@ which is how a LabelWriter expects to be driven from a browser.
 | DYMO 30323 | 2⅛″ × 4″ shipping | QR, code, name, location, 12 items |
 | Custom size… | any width × height in mm | scaled automatically to the space |
 
+Each label can carry a **QR code**, a **Code 128 barcode**, or both — the
+`Symbols` picker on the print page. The default, *Automatic*, prints both on
+stock at least 48 mm wide and QR only on anything narrower, because a barcode's
+bars get too fine to scan on a small label. The print page always tells you the
+exact bar width it is about to produce (a 1D laser generally needs 0.30 mm or
+more): a 2¼″ label gives 0.41 mm, a 4″ shipping label 0.74 mm. When a barcode is
+included on short stock, the QR shrinks and the contents list is dropped so
+nothing spills off the label.
+
 In the print dialog: choose the LabelWriter, set the label size to the matching
 stock, margins to **none**, and scale to **100%** with "fit to page" off.
-Anything else shrinks the QR code and can push it off the label.
+Anything else shrinks the codes and can push them off the label.
 
 On the 1″ square stock the QR is 16 mm across, which scans fine from a phone —
 but the QR encodes the full URL, so a short base address (`http://192.168.1.24:8080`)
@@ -175,6 +219,8 @@ use it too.
 | `GET` `POST` | `/api/containers` | List / create containers |
 | `GET` `PUT` `DELETE` | `/api/containers/{id}` | Container with its ancestors, children and contents |
 | `GET` | `/api/containers/{id}/qr.svg?size=240` | QR code for a container |
+| `GET` | `/api/containers/{id}/barcode.svg` | Code 128 barcode for a container |
+| `GET` | `/api/scan/{code}` | What a scanned code is: a container, an item, or unknown |
 | `POST` | `/api/containers/{id}/verify` | Record that the contents were just confirmed |
 | `GET` | `/api/stale` | Containers overdue for a check, most overdue first |
 | `GET` | `/api/by-code/{code}` | Same detail, looked up by label code |
@@ -209,7 +255,7 @@ it runs on, use `--host 127.0.0.1` (QR scanning from a phone won't work then).
 ## Development
 
 ```bash
-cargo test     # search ranking, nesting, staleness, tags and label codes
+cargo test     # search ranking, nesting, staleness, tags, scanning, Code 128
 cargo run      # debug server on :8080
 ```
 
@@ -221,6 +267,7 @@ src/db.rs       connection pool, schema migrations
 src/store.rs    all SQL and the data-model rules
 src/api.rs      JSON handlers
 src/media.rs    photos, QR codes, printable labels
+src/barcode.rs  Code 128 encoding
 src/backup.rs   export and import
 static/         frontend, embedded into the binary at compile time
 ```

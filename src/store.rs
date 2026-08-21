@@ -71,6 +71,32 @@ fn generate_code(conn: &Connection, kind: &str) -> AppResult<String> {
     Err(AppError::internal("could not allocate a unique label code"))
 }
 
+/// Barcodes are stored trimmed; blank means "none".
+pub fn normalize_barcode(barcode: Option<&str>) -> Option<String> {
+    barcode.map(str::trim).filter(|b| !b.is_empty()).map(|b| b.to_string())
+}
+
+/// Refuses a barcode already used elsewhere, so one scan means one thing.
+fn check_barcode_free(
+    conn: &Connection,
+    table: &str,
+    barcode: &Option<String>,
+    exclude_id: Option<i64>,
+) -> AppResult<()> {
+    let Some(value) = barcode else { return Ok(()) };
+    let sql = format!(
+        "SELECT name FROM {table} WHERE barcode = ?1 COLLATE NOCASE AND id IS NOT ?2 LIMIT 1"
+    );
+    let clash: Option<String> =
+        conn.query_row(&sql, params![value, exclude_id], |r| r.get(0)).optional()?;
+    match clash {
+        Some(name) => Err(AppError::bad_request(format!(
+            "barcode {value} is already assigned to {name}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub fn normalize_code(code: &str) -> String {
     code.trim().to_uppercase().replace(' ', "-")
 }
@@ -85,6 +111,7 @@ struct RawContainer {
     parent_id: Option<i64>,
     notes: String,
     photo_id: Option<i64>,
+    barcode: Option<String>,
     created_at: String,
     updated_at: String,
     checked_at: Option<String>,
@@ -93,7 +120,7 @@ struct RawContainer {
 
 fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
     let mut stmt = conn.prepare(
-        "SELECT id, code, name, kind, parent_id, notes, photo_id, created_at, updated_at,
+        "SELECT id, code, name, kind, parent_id, notes, photo_id, barcode, created_at, updated_at,
                 checked_at,
                 CAST(julianday('now') - julianday(COALESCE(checked_at, created_at)) AS INTEGER)
          FROM containers",
@@ -107,10 +134,11 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
             parent_id: r.get(4)?,
             notes: r.get(5)?,
             photo_id: r.get(6)?,
-            created_at: r.get(7)?,
-            updated_at: r.get(8)?,
-            checked_at: r.get(9)?,
-            age_days: r.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0),
+            barcode: r.get(7)?,
+            created_at: r.get(8)?,
+            updated_at: r.get(9)?,
+            checked_at: r.get(10)?,
+            age_days: r.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -177,6 +205,7 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
                 parent_id: c.parent_id,
                 notes: c.notes.clone(),
                 photo_id: c.photo_id,
+                barcode: c.barcode.clone(),
                 created_at: c.created_at.clone(),
                 updated_at: c.updated_at.clone(),
                 checked_at: c.checked_at.clone(),
@@ -265,10 +294,12 @@ pub fn create_container(conn: &Connection, input: &ContainerInput) -> AppResult<
         _ => generate_code(conn, &kind)?,
     };
 
+    let barcode = normalize_barcode(input.barcode.as_deref());
+    check_barcode_free(conn, "containers", &barcode, None)?;
     conn.execute(
-        "INSERT INTO containers (code, name, kind, parent_id, notes, photo_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![code, name, kind, input.parent_id, input.notes.trim(), input.photo_id],
+        "INSERT INTO containers (code, name, kind, parent_id, notes, photo_id, barcode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![code, name, kind, input.parent_id, input.notes.trim(), input.photo_id, barcode],
     )?;
     container_by_id(conn, conn.last_insert_rowid())
 }
@@ -295,12 +326,16 @@ pub fn update_container(conn: &Connection, id: i64, input: &ContainerInput) -> A
         _ => all.iter().find(|c| c.id == id).map(|c| c.code.clone()).unwrap_or_default(),
     };
 
+    let barcode = normalize_barcode(input.barcode.as_deref());
+    check_barcode_free(conn, "containers", &barcode, Some(id))?;
     conn.execute(
         "UPDATE containers
             SET code = ?1, name = ?2, kind = ?3, parent_id = ?4, notes = ?5, photo_id = ?6,
-                updated_at = datetime('now')
-          WHERE id = ?7",
-        params![code, name, kind, input.parent_id, input.notes.trim(), input.photo_id, id],
+                barcode = ?7, updated_at = datetime('now')
+          WHERE id = ?8",
+        params![
+            code, name, kind, input.parent_id, input.notes.trim(), input.photo_id, barcode, id
+        ],
     )?;
     container_by_id(conn, id)
 }
@@ -418,7 +453,7 @@ fn search_terms(q: &str) -> Vec<String> {
 pub fn query_items(conn: &Connection, query: &ItemQuery) -> AppResult<Vec<Item>> {
     let mut sql = String::from(
         "SELECT i.id, i.name, i.description, i.quantity, i.container_id, i.photo_id,
-                i.created_at, i.updated_at, c.code, c.name
+                i.barcode, i.created_at, i.updated_at, c.code, c.name
            FROM items i
            LEFT JOIN containers c ON c.id = i.container_id
           WHERE 1 = 1",
@@ -486,11 +521,12 @@ pub fn query_items(conn: &Connection, query: &ItemQuery) -> AppResult<Vec<Item>>
             quantity: r.get(3)?,
             container_id: r.get(4)?,
             photo_id: r.get(5)?,
-            created_at: r.get(6)?,
-            updated_at: r.get(7)?,
+            barcode: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
             tags: Vec::new(),
-            container_code: r.get(8)?,
-            container_name: r.get(9)?,
+            container_code: r.get(9)?,
+            container_name: r.get(10)?,
             container_path: None,
         })
     })?;
@@ -612,16 +648,19 @@ pub fn create_item(conn: &mut Connection, input: &ItemInput) -> AppResult<Item> 
             return Err(AppError::bad_request("container does not exist"));
         }
     }
+    let barcode = normalize_barcode(input.barcode.as_deref());
+    check_barcode_free(conn, "items", &barcode, None)?;
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO items (name, description, quantity, container_id, photo_id)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO items (name, description, quantity, container_id, photo_id, barcode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             name,
             input.description.trim(),
             input.quantity.max(0),
             input.container_id,
-            input.photo_id
+            input.photo_id,
+            barcode
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -635,18 +674,21 @@ pub fn update_item(conn: &mut Connection, id: i64, input: &ItemInput) -> AppResu
     if name.is_empty() {
         return Err(AppError::bad_request("name is required"));
     }
+    let barcode = normalize_barcode(input.barcode.as_deref());
+    check_barcode_free(conn, "items", &barcode, Some(id))?;
     let tx = conn.transaction()?;
     let changed = tx.execute(
         "UPDATE items
             SET name = ?1, description = ?2, quantity = ?3, container_id = ?4, photo_id = ?5,
-                updated_at = datetime('now')
-          WHERE id = ?6",
+                barcode = ?6, updated_at = datetime('now')
+          WHERE id = ?7",
         params![
             name,
             input.description.trim(),
             input.quantity.max(0),
             input.container_id,
             input.photo_id,
+            barcode,
             id
         ],
     )?;
@@ -793,6 +835,49 @@ pub fn delete_tag(conn: &Connection, name: &str) -> AppResult<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------ scanning
+
+/// Works out what a scanned string refers to: one of our label codes, a
+/// barcode stuck on a container, or a barcode on an item.
+pub fn resolve_scan(conn: &Connection, raw: &str) -> AppResult<ScanResult> {
+    let scanned = raw.trim();
+    if scanned.is_empty() {
+        return Err(AppError::bad_request("nothing was scanned"));
+    }
+
+    let by_code: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM containers WHERE code = ?1 COLLATE NOCASE",
+            [normalize_code(scanned)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let container_id = match by_code {
+        Some(id) => Some(id),
+        None => conn
+            .query_row(
+                "SELECT id FROM containers WHERE barcode = ?1 COLLATE NOCASE",
+                [scanned],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
+    if let Some(id) = container_id {
+        return Ok(ScanResult::Container { container: Box::new(container_detail(conn, id)?) });
+    }
+
+    let item_id: Option<i64> = conn
+        .query_row("SELECT id FROM items WHERE barcode = ?1 COLLATE NOCASE", [scanned], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if let Some(id) = item_id {
+        return Ok(ScanResult::Item { item: Box::new(item_by_id(conn, id)?) });
+    }
+
+    Ok(ScanResult::Unknown { code: scanned.to_string() })
+}
+
 // --------------------------------------------------------------------- stats
 
 pub fn stats(conn: &Connection) -> AppResult<Stats> {
@@ -840,6 +925,7 @@ mod tests {
                 notes: String::new(),
                 photo_id: None,
                 code: None,
+                barcode: None,
             },
         )
         .unwrap()
@@ -855,6 +941,7 @@ mod tests {
                 container_id: container,
                 photo_id: None,
                 tags: tags.iter().map(|t| t.to_string()).collect(),
+                barcode: None,
             },
         )
         .unwrap()
@@ -884,6 +971,7 @@ mod tests {
                 parent_id: None,
                 notes: String::new(),
                 photo_id: None,
+                barcode: None,
                 code: Some(first.code.to_lowercase()),
             },
         );
@@ -913,6 +1001,7 @@ mod tests {
             notes: String::new(),
             photo_id: None,
             code: None,
+            barcode: None,
         };
         assert!(update_container(&conn, garage.id, &input).is_err());
     }
@@ -1151,6 +1240,107 @@ mod tests {
         assert_eq!(item_by_id(&conn, drill.id).unwrap().tags, vec!["tools".to_string()]);
     }
 
+    fn with_barcode(conn: &mut Connection, name: &str, barcode: &str, container: Option<i64>) -> Item {
+        create_item(
+            conn,
+            &ItemInput {
+                name: name.into(),
+                description: String::new(),
+                quantity: 1,
+                container_id: container,
+                photo_id: None,
+                tags: vec![],
+                barcode: Some(barcode.into()),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scanning_a_label_code_finds_the_container() {
+        let mut conn = test_db();
+        let bin = container(&conn, "Camping", "box", None);
+        item(&mut conn, "Tent", "", Some(bin.id), &[]);
+
+        match resolve_scan(&conn, &bin.code.to_lowercase()).unwrap() {
+            ScanResult::Container { container } => {
+                assert_eq!(container.container.id, bin.id);
+                assert_eq!(container.items.len(), 1, "contents come back with the box");
+            }
+            other => panic!("expected a container, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scanning_a_product_barcode_finds_the_item() {
+        let mut conn = test_db();
+        let drill = with_barcode(&mut conn, "Drill", "012345678905", None);
+        match resolve_scan(&conn, " 012345678905 ").unwrap() {
+            ScanResult::Item { item } => assert_eq!(item.id, drill.id),
+            other => panic!("expected an item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scanning_a_barcode_stuck_on_a_box_finds_the_box() {
+        let conn = test_db();
+        let bin = create_container(
+            &conn,
+            &ContainerInput {
+                name: "Camping".into(),
+                kind: "box".into(),
+                parent_id: None,
+                notes: String::new(),
+                photo_id: None,
+                code: None,
+                barcode: Some("9001234567890".into()),
+            },
+        )
+        .unwrap();
+        match resolve_scan(&conn, "9001234567890").unwrap() {
+            ScanResult::Container { container } => assert_eq!(container.container.id, bin.id),
+            other => panic!("expected a container, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_scan_reports_the_raw_code() {
+        let conn = test_db();
+        match resolve_scan(&conn, "5060337502900").unwrap() {
+            ScanResult::Unknown { code } => assert_eq!(code, "5060337502900"),
+            other => panic!("expected unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_barcode_cannot_be_assigned_to_two_things() {
+        let mut conn = test_db();
+        with_barcode(&mut conn, "Drill", "012345678905", None);
+        let clash = create_item(
+            &mut conn,
+            &ItemInput {
+                name: "Another drill".into(),
+                description: String::new(),
+                quantity: 1,
+                container_id: None,
+                photo_id: None,
+                tags: vec![],
+                barcode: Some("012345678905".into()),
+            },
+        );
+        assert!(clash.is_err(), "one scan must resolve to one thing");
+        assert!(clash.unwrap_err().message.contains("already assigned to Drill"));
+    }
+
+    #[test]
+    fn blank_barcodes_are_stored_as_none_and_never_clash() {
+        let mut conn = test_db();
+        let a = with_barcode(&mut conn, "Hammer", "   ", None);
+        let b = with_barcode(&mut conn, "Saw", "", None);
+        assert_eq!(a.barcode, None);
+        assert_eq!(b.barcode, None);
+    }
+
     #[test]
     fn items_must_be_named() {
         let mut conn = test_db();
@@ -1163,6 +1353,7 @@ mod tests {
                 container_id: None,
                 photo_id: None,
                 tags: vec![],
+                barcode: None,
             },
         );
         assert!(blank.is_err());
