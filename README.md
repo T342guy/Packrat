@@ -328,8 +328,18 @@ want it faster, split the build across native `ubuntu-latest` and
 
 ```bash
 cargo test     # search ranking, nesting, staleness, tags, scanning, Code 128
+cargo bench    # timings over synthetic inventories of 1k, 4k and 16k items
 cargo run      # debug server on :8080
 ```
+
+The benchmarks exist because a real regression got through once: opening a
+shelf re-queried every box on it separately, which was invisible on the example
+data and 16x slower on a full one. That case is now measured directly, along
+with search, scanning and listing. On a 4,000-item inventory — far larger than
+a full garage — a barcode scan resolves in about 0.14 ms and opening a box
+takes about 2 ms. Search is a `LIKE` scan and grows with the inventory: 4 ms at
+1,000 items, 90 ms at 16,000. If anyone ever fills a garage that far, that is
+the number to attack, probably with SQLite's FTS5.
 
 Layout:
 

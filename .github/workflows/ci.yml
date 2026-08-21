@@ -50,3 +50,30 @@ jobs:
           # And a label sheet should render, QR codes and all.
           curl -fsS "http://127.0.0.1:8099/labels?format=dymo-30334&symbols=both" | grep -q "<svg"
           echo "smoke test passed"
+
+  bench:
+    name: Benchmarks
+    # Informational, not a gate: runner timings are too noisy to fail a build
+    # on, but the numbers are worth having on the record for each change.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmarks
+        run: |
+          cargo bench --bench inventory -- --warm-up-time 0.3 --measurement-time 1.0 \
+            | tee bench.txt
+      - name: Publish the numbers
+        run: |
+          {
+            echo "### Benchmarks"
+            echo
+            echo '| case | median |'
+            echo '| --- | --- |'
+            paste -d'|' \
+              <(grep -E '^inventory/' bench.txt) \
+              <(grep -E '^ +time:' bench.txt | sed 's/.*\[[^ ]* [^ ]* \([^ ]* [^ ]*\) .*/\1/') \
+              | sed 's/^/| /; s/|/ | /2; s/$/ |/'
+          } >> "$GITHUB_STEP_SUMMARY"

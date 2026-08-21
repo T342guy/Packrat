@@ -31,7 +31,7 @@ pub fn open(path: &std::path::Path) -> Result<Pool, String> {
 }
 
 /// Schema migrations, tracked with SQLite's `user_version`.
-pub(crate) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
     if version < 1 {

@@ -29,6 +29,7 @@ impl From<ItemQueryParams> for ItemQuery {
             q: p.q.filter(|s| !s.trim().is_empty()),
             container_id: p.container,
             container_ids: None,
+            ids: None,
             include_nested: p.nested,
             tag: p.tag.filter(|s| !s.trim().is_empty()),
             unfiled: p.unfiled,
