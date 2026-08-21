@@ -1,55 +1,9 @@
-//! Packrat — a small, locally-hostable inventory server.
-//!
-//! Everything lives in one SQLite file and one binary: run it on a machine at
-//! home, open it from any phone or laptop on the same network, and scan the QR
-//! code on a box to see what's inside without opening it.
+//! Command line entry point: parses options, opens the database and serves.
 
-mod api;
-mod backup;
-mod barcode;
-mod db;
-mod error;
-mod media;
-mod models;
-mod net;
-mod store;
-
-use axum::extract::DefaultBodyLimit;
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{delete, get, post, put};
-use axum::Router;
-use std::net::{IpAddr, SocketAddr};
+use packrat::{db, logging, net, router, seed_example, AppState};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-
-#[derive(Clone)]
-pub struct AppState {
-    pub pool: db::Pool,
-    pub port: u16,
-    pub lan_ip: Option<IpAddr>,
-    /// Base URL baked into QR codes. Configurable at runtime from Settings.
-    pub public_url_override: Arc<RwLock<Option<String>>>,
-}
-
-impl AppState {
-    /// The URL this server is most likely reachable at from a phone.
-    pub fn detected_url(&self) -> String {
-        match self.lan_ip {
-            Some(ip) => format!("http://{}:{}", ip, self.port),
-            None => format!("http://localhost:{}", self.port),
-        }
-    }
-
-    /// The base URL QR codes point at.
-    pub fn public_url(&self) -> String {
-        self.public_url_override
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| self.detected_url())
-    }
-}
 
 struct Args {
     port: u16,
@@ -57,6 +11,10 @@ struct Args {
     database: PathBuf,
     public_url: Option<String>,
     seed_example: bool,
+    /// Level for our own logs: off, error, warn, info, debug or trace.
+    log_level: String,
+    /// Watch a running instance's logs instead of starting a server.
+    hook_logging: bool,
 }
 
 const HELP: &str = "\
@@ -74,11 +32,25 @@ OPTIONS:
     -h, --help              Print this help
     -V, --version           Print version
 
+LOGGING:
+        --start-with-logging  Serve with logging turned up (debug): every request,
+                              every scan, every database migration
+        --log <LEVEL>         Serve at a specific level: off, error, warn, info,
+                              debug, trace [default: warn]
+        --hook-logging        Do not serve. Attach to a Packrat already running on
+                              this machine — one started by systemd, launchd or
+                              Docker — and print its logs live until Ctrl-C.
+                              Uses --port to find it.
+
 ENVIRONMENT:
     Every option can be set by environment variable instead, which is usually
     easier in a container. Command line flags win over environment variables.
 
     PACKRAT_PORT, PACKRAT_HOST, PACKRAT_DB, PACKRAT_PUBLIC_URL, PACKRAT_SEED_EXAMPLE
+    PACKRAT_LOG_LEVEL   same values as --log
+
+    PACKRAT_LOG accepts the full RUST_LOG syntax and overrides --log, e.g.
+    PACKRAT_LOG=packrat=debug,axum=info
 ";
 
 /// Reads an option from the environment, ignoring blanks so an empty variable
@@ -117,6 +89,8 @@ fn parse_args() -> Result<Args, String> {
             env_var("PACKRAT_SEED_EXAMPLE").as_deref(),
             Some("1" | "true" | "yes" | "on")
         ),
+        log_level: env_var("PACKRAT_LOG_LEVEL").unwrap_or_else(|| "warn".to_string()),
+        hook_logging: false,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -141,6 +115,9 @@ fn parse_args() -> Result<Args, String> {
                 args.public_url = Some(value()?.trim_end_matches('/').to_string());
             }
             "--seed-example" => args.seed_example = true,
+            "--start-with-logging" => args.log_level = "debug".to_string(),
+            "--log" => args.log_level = value()?,
+            "--hook-logging" => args.hook_logging = true,
             other => return Err(format!("unknown option {other}\n\n{HELP}")),
         }
     }
@@ -155,8 +132,89 @@ async fn main() {
     }
 }
 
+/// Attaches to a running instance and prints its log stream.
+///
+/// Speaks just enough HTTP to read a chunked server-sent-event body, which
+/// avoids pulling an HTTP client into the binary for one debugging command.
+async fn hook_logging(port: u16) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let address = format!("127.0.0.1:{port}");
+    let mut stream = tokio::net::TcpStream::connect(&address)
+        .await
+        .map_err(|e| {
+            format!(
+                "nothing is answering on {address}: {e}\n\n\
+             Is Packrat running? Check with `systemctl status packrat`, or start it\n\
+             yourself with `packrat --start-with-logging`. If it is on another port,\n\
+             pass --port."
+            )
+        })?;
+    stream
+        .write_all(
+            format!(
+                "GET /api/logs/stream HTTP/1.1\r\nHost: {address}\r\n\
+                 Accept: text/event-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .map_err(|e| format!("could not ask for the log stream: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| format!("no reply from {address}: {e}"))?;
+    if !line.contains(" 200 ") {
+        return Err(format!("{address} answered with {}", line.trim()));
+    }
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).await.unwrap_or(0) == 0 || header.trim().is_empty() {
+            break;
+        }
+    }
+
+    println!("\n  Watching Packrat on {address}. Press Ctrl-C to stop.");
+    println!("  Nothing will appear until it logs something — try loading a page.\n");
+
+    // Chunked transfer encoding: a hex length, the bytes, then CRLF.
+    loop {
+        let mut size_line = String::new();
+        if reader.read_line(&mut size_line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        if size_line.trim().is_empty() {
+            continue;
+        }
+        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16)
+            .unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let mut chunk = vec![0u8; size + 2];
+        if reader.read_exact(&mut chunk).await.is_err() {
+            break;
+        }
+        for line in String::from_utf8_lossy(&chunk[..size]).lines() {
+            if let Some(message) = line.strip_prefix("data: ") {
+                println!("{message}");
+            }
+        }
+    }
+    println!("\n  The stream ended — Packrat probably stopped.");
+    Ok(())
+}
+
 async fn run() -> Result<(), String> {
     let args = parse_args()?;
+
+    if args.hook_logging {
+        return hook_logging(args.port).await;
+    }
+    logging::init(&args.log_level);
     let pool = db::open(&args.database)?;
 
     if args.seed_example {
@@ -182,6 +240,33 @@ async fn run() -> Result<(), String> {
         lan_ip: net::lan_ip(),
         public_url_override: Arc::new(RwLock::new(args.public_url.clone().or(stored))),
     };
+
+    // Report a clock that has moved backwards: check-up ages are measured
+    // against it, and a wrong clock would quietly make everything look fresh.
+    {
+        let conn = state.pool.get().map_err(|e| e.to_string())?;
+        match packrat::store::clock_status(&conn) {
+            Ok(status) => {
+                if let Some(behind) = status.behind_seconds {
+                    let days = behind / 86_400;
+                    tracing::warn!(behind_seconds = behind, "system clock is behind");
+                    println!(
+                        "\n  ⚠ This machine's clock reads earlier than the last time Packrat saw\n    \
+                         ({} behind). Check-up ages are held at the later of the two, so nothing\n    \
+                         is wrongly marked fresh — but fixing the clock is worth doing.",
+                        if days > 0 {
+                            format!("about {days} days")
+                        } else {
+                            format!("{} minutes", behind / 60)
+                        }
+                    );
+                }
+            }
+            Err(e) => eprintln!("could not read the clock state: {}", e.message),
+        }
+        let _ = packrat::store::touch_clock(&conn);
+    }
+    packrat::spawn_clock_keeper(state.pool.clone());
 
     let app = router(state.clone());
     let bind: SocketAddr = format!("{}:{}", args.host, args.port)
@@ -223,6 +308,13 @@ async fn run() -> Result<(), String> {
     println!("\n  No password is required, so keep this on a network you trust.");
     println!("  Press Ctrl-C to stop.\n");
 
+    tracing::info!(
+        port = args.port,
+        database = %absolute.display(),
+        version = env!("CARGO_PKG_VERSION"),
+        "packrat started"
+    );
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -232,234 +324,4 @@ async fn run() -> Result<(), String> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     println!("\n  Shutting down. Your inventory is saved.");
-}
-
-fn router(state: AppState) -> Router {
-    Router::new()
-        // Frontend
-        .route("/", get(index))
-        .route("/app.js", get(app_js))
-        .route("/styles.css", get(styles_css))
-        .route("/icon.svg", get(icon_svg))
-        .route("/manifest.webmanifest", get(manifest))
-        // What a QR code on a box resolves to.
-        .route("/b/{code}", get(scan_redirect))
-        .route("/labels", get(media::print_labels))
-        .route("/api/label-formats", get(media::label_formats))
-        // Containers
-        .route(
-            "/api/containers",
-            get(api::list_containers).post(api::create_container),
-        )
-        .route("/api/containers/{id}", get(api::get_container))
-        .route("/api/containers/{id}", put(api::update_container))
-        .route("/api/containers/{id}", delete(api::delete_container))
-        .route("/api/containers/{id}/qr.svg", get(media::container_qr))
-        .route("/api/containers/{id}/verify", post(api::verify_container))
-        .route(
-            "/api/containers/{id}/barcode.svg",
-            get(media::container_barcode),
-        )
-        .route("/api/scan/{code}", get(api::scan))
-        .route("/api/stale", get(api::stale_containers))
-        .route("/api/by-code/{code}", get(api::get_container_by_code))
-        // Items
-        .route("/api/items", get(api::list_items).post(api::create_item))
-        .route("/api/items/{id}", get(api::get_item))
-        .route("/api/items/{id}", put(api::update_item))
-        .route("/api/items/{id}", delete(api::delete_item))
-        .route("/api/items/{id}/move", post(api::move_item))
-        .route("/api/items/{id}/quantity", post(api::adjust_quantity))
-        .route("/api/items/bulk-move", post(api::bulk_move))
-        // Lookup and meta
-        .route("/api/search", get(api::search))
-        .route("/api/tags", get(api::list_tags))
-        .route(
-            "/api/tags/{name}",
-            put(api::rename_tag).delete(api::delete_tag),
-        )
-        .route("/api/stats", get(api::stats))
-        .route("/api/bootstrap", get(api::bootstrap))
-        .route("/api/health", get(api::health))
-        .route(
-            "/api/settings",
-            get(api::get_settings).put(api::update_settings),
-        )
-        // Photos
-        .route("/api/photos", post(media::upload_photo))
-        .route("/photos/{id}", get(media::get_photo))
-        // Backup
-        .route("/api/export", get(backup::export_json))
-        .route("/api/export.csv", get(backup::export_csv))
-        .route("/api/import", post(backup::import_json))
-        .fallback(not_found)
-        .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
-        .with_state(state)
-}
-
-async fn scan_redirect(axum::extract::Path(code): axum::extract::Path<String>) -> Redirect {
-    let safe: String = code
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    Redirect::to(&format!("/#/box/{safe}"))
-}
-
-async fn not_found(uri: axum::http::Uri) -> Response {
-    if uri.path().starts_with("/api/") {
-        return (
-            StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({ "error": format!("no route for {}", uri.path()) })),
-        )
-            .into_response();
-    }
-    // Anything else is a deep link into the single-page app.
-    index().await.into_response()
-}
-
-fn asset(content_type: &'static str, body: &'static str) -> Response {
-    ([(header::CONTENT_TYPE, content_type)], body).into_response()
-}
-
-async fn index() -> Response {
-    asset(
-        "text/html; charset=utf-8",
-        include_str!("../static/index.html"),
-    )
-}
-async fn app_js() -> Response {
-    asset(
-        "application/javascript; charset=utf-8",
-        include_str!("../static/app.js"),
-    )
-}
-async fn styles_css() -> Response {
-    asset(
-        "text/css; charset=utf-8",
-        include_str!("../static/styles.css"),
-    )
-}
-async fn icon_svg() -> Response {
-    asset("image/svg+xml", include_str!("../static/icon.svg"))
-}
-async fn manifest() -> Response {
-    asset(
-        "application/manifest+json",
-        include_str!("../static/manifest.webmanifest"),
-    )
-}
-
-/// Fills an empty database with a plausible garage so the app has something to
-/// show on the first run.
-fn seed_example(conn: &mut rusqlite::Connection) -> Result<bool, String> {
-    let existing: i64 = conn
-        .query_row("SELECT COUNT(*) FROM containers", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    if existing > 0 {
-        return Ok(false);
-    }
-    let make_container = |conn: &rusqlite::Connection,
-                          name: &str,
-                          kind: &str,
-                          parent: Option<i64>|
-     -> Result<i64, String> {
-        let input = models::ContainerInput {
-            name: name.to_string(),
-            kind: kind.to_string(),
-            parent_id: parent,
-            notes: String::new(),
-            photo_id: None,
-            code: None,
-            barcode: None,
-        };
-        store::create_container(conn, &input)
-            .map(|c| c.id)
-            .map_err(|e| e.message)
-    };
-
-    let garage = make_container(conn, "Garage", "area", None)?;
-    let shelves = make_container(conn, "North wall shelving", "shelf", Some(garage))?;
-    let workbench = make_container(conn, "Workbench cabinet", "cabinet", Some(garage))?;
-    let camping = make_container(conn, "Camping gear", "box", Some(shelves))?;
-    let holiday = make_container(conn, "Holiday decorations", "bin", Some(shelves))?;
-    let fasteners = make_container(conn, "Fasteners", "drawer", Some(workbench))?;
-
-    let seed_items: &[(&str, &str, i64, i64, &[&str])] = &[
-        (
-            "4-person tent",
-            "Blue dome tent, poles in side pocket",
-            1,
-            camping,
-            &["camping", "outdoors"],
-        ),
-        (
-            "Sleeping bags",
-            "Two mummy bags, rated 0°C",
-            2,
-            camping,
-            &["camping"],
-        ),
-        (
-            "Camping stove",
-            "Propane, needs a full canister",
-            1,
-            camping,
-            &["camping", "cooking"],
-        ),
-        (
-            "String lights",
-            "Warm white, 3 strands, one has a dead bulb",
-            3,
-            holiday,
-            &["holiday"],
-        ),
-        (
-            "Wreath",
-            "Front door wreath in a paper sleeve",
-            1,
-            holiday,
-            &["holiday"],
-        ),
-        (
-            "Wood screws #8 x 1½\"",
-            "Roughly half a box left",
-            1,
-            fasteners,
-            &["hardware", "screws"],
-        ),
-        (
-            "Drywall anchors",
-            "Assorted sizes in a plastic case",
-            1,
-            fasteners,
-            &["hardware"],
-        ),
-        (
-            "Cordless drill",
-            "Battery on the charger by the door",
-            1,
-            workbench,
-            &["tools", "power-tools"],
-        ),
-        (
-            "Extension cord 25ft",
-            "Orange, heavy gauge",
-            2,
-            workbench,
-            &["tools", "electrical"],
-        ),
-    ];
-    for (name, description, quantity, container, tags) in seed_items {
-        let input = models::ItemInput {
-            name: name.to_string(),
-            description: description.to_string(),
-            quantity: *quantity,
-            container_id: Some(*container),
-            photo_id: None,
-            tags: tags.iter().map(|t| t.to_string()).collect(),
-            barcode: None,
-        };
-        store::create_item(conn, &input).map_err(|e| e.message)?;
-    }
-    Ok(true)
 }

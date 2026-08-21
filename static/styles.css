@@ -410,3 +410,5 @@ details.childbox > .list { border-top: 1px solid var(--border); }
 }
 .scan-line.move { color: var(--ok); }
 .scan-line.warn, .scan-line.error { color: var(--danger); }
+
+.notice.clock-warning { border-left-color: var(--danger); }
