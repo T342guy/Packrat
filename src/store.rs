@@ -233,7 +233,7 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
         })
         .collect();
 
-    out.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    out.sort_by_key(|c| c.path.to_lowercase());
     Ok(out)
 }
 

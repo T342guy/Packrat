@@ -117,7 +117,7 @@ pub async fn stale_containers(State(st): State<AppState>) -> AppResult<Json<Valu
             .into_iter()
             .filter(|x| x.stale)
             .collect();
-        stale.sort_by(|a, b| b.age_days.cmp(&a.age_days));
+        stale.sort_by_key(|c| std::cmp::Reverse(c.age_days));
         Ok(Json(
             json!({ "stale_after_days": days, "containers": stale }),
         ))
