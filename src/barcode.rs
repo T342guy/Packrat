@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Code 128 (subset B) encoding.
 //!
 //! Cheap wireless barcode scanners are usually 1D lasers that cannot read a QR

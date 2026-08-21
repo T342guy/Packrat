@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 /* Packrat — single-page frontend. No framework, no build step:
    the whole thing is served from the Rust binary. */
 
@@ -72,6 +73,7 @@ const state = {
   kinds: [],
   publicUrl: '',
   clock: null,
+  about: null,
 };
 
 async function refreshState() {
@@ -82,6 +84,13 @@ async function refreshState() {
   state.kinds = data.kinds;
   state.publicUrl = data.public_url;
   state.clock = data.clock;
+  state.about = {
+    version: data.version,
+    copyright: data.copyright,
+    license: data.license,
+    sourceUrl: data.source_url,
+  };
+  renderFooter();
 }
 
 const containerById = (id) => state.containers.find((c) => c.id === Number(id));
@@ -1322,6 +1331,27 @@ function currentContainerId() {
     ? containerById(key)
     : state.containers.find((c) => c.code.toUpperCase() === key.toUpperCase());
   return found ? found.id : null;
+}
+
+/* The notices GPLv3 section 5(d) asks an interactive interface to show: who
+   holds copyright, that there is no warranty, that it may be redistributed
+   under the GPL, and where to read the licence. The licence link is served by
+   Packrat itself, so it works with no internet connection. */
+function renderFooter() {
+  const el = $('#site-footer');
+  if (!el || !state.about) return;
+  const { version, copyright, license, sourceUrl } = state.about;
+  el.innerHTML = `
+    <div class="footer-line">
+      <strong>Packrat ${esc(version)}</strong>
+      <span>${esc(copyright)}</span>
+    </div>
+    <div class="footer-line">
+      <span>Free software under the <a href="/license">${esc(license)}</a>: you may
+        redistribute it under those terms. There is NO WARRANTY, to the extent
+        permitted by law.</span>
+      <a href="${esc(sourceUrl)}" target="_blank" rel="noopener">Source code</a>
+    </div>`;
 }
 
 // ------------------------------------------------------------------- router

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Packrat — a small, locally-hostable inventory server.
 //!
 //! Everything lives in one SQLite file and one binary: run it on a machine at
@@ -6,6 +7,14 @@
 //!
 //! The crate is a library with a thin binary on top so that benchmarks and
 //! integration tests can drive the same code the server runs.
+
+/// The notices GPLv3 section 5(d) asks an interactive interface to display.
+/// Kept in one place so the command line, the API and the web footer cannot
+/// drift apart.
+pub const COPYRIGHT: &str = "Copyright © 2026 T342guy";
+pub const LICENSE_NAME: &str = "GPL-3.0-only";
+pub const SOURCE_URL: &str = "https://github.com/T342guy/packrat";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod api;
 pub mod backup;
@@ -96,6 +105,10 @@ pub fn router(state: AppState) -> Router {
         .route("/styles.css", get(styles_css))
         .route("/icon.svg", get(icon_svg))
         .route("/manifest.webmanifest", get(manifest))
+        // Served from the binary so "how to view a copy of this License" holds
+        // on a machine with no internet connection, which is the normal case
+        // for something running in a garage.
+        .route("/license", get(license))
         // What a QR code on a box resolves to.
         .route("/b/{code}", get(scan_redirect))
         .route("/labels", get(media::print_labels))
@@ -197,6 +210,9 @@ async fn styles_css() -> Response {
 }
 async fn icon_svg() -> Response {
     asset("image/svg+xml", include_str!("../static/icon.svg"))
+}
+async fn license() -> Response {
+    asset("text/plain; charset=utf-8", include_str!("../LICENSE"))
 }
 async fn manifest() -> Response {
     asset(

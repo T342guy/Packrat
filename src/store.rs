@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! All SQL lives here. Handlers stay thin; this module owns the data model
 //! invariants (label codes, container nesting, tag normalisation).
 

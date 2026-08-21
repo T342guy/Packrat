@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Benchmarks over a synthetic inventory much larger than a real garage.
 //!
 //! These exist because a real regression slipped through once: opening a shelf

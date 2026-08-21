@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 # Prints the next release version, given the version in Cargo.toml and a bump.
 #
 #   ./scripts/next-version.sh patch   ->  0.1.1-2026.aug.21

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::*;
@@ -359,6 +360,10 @@ pub async fn bootstrap(State(st): State<AppState>) -> AppResult<Json<Value>> {
             "public_url": base_url,
             "stale_after_days": store::stale_after_days(c),
             "clock": store::clock_status(c)?,
+            "version": crate::VERSION,
+            "copyright": crate::COPYRIGHT,
+            "license": crate::LICENSE_NAME,
+            "source_url": crate::SOURCE_URL,
         })))
     })
     .await

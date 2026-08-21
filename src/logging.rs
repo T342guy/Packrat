@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Logging.
 //!
 //! Every log line goes to stdout — which is where a service manager or Docker

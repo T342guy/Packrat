@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Export and import. The whole inventory is a single SQLite file, but a
 //! plain-JSON export means the data outlives this program.
 

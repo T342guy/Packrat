@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Command line entry point: parses options, opens the database and serves.
 
 use packrat::{db, logging, net, router, seed_example, AppState};
@@ -30,7 +31,7 @@ OPTIONS:
         --public-url <URL>  Base URL to encode in QR codes (default: auto-detected LAN address)
         --seed-example      Populate an empty database with a small example inventory
     -h, --help              Print this help
-    -V, --version           Print version
+    -v, -V, --version       Print version and licensing
 
 LOGGING:
         --start-with-logging  Serve with logging turned up (debug): every request,
@@ -100,8 +101,14 @@ fn parse_args() -> Result<Args, String> {
                 print!("{HELP}");
                 std::process::exit(0);
             }
-            "-V" | "--version" => {
-                println!("packrat {}", env!("CARGO_PKG_VERSION"));
+            "-v" | "-V" | "--version" => {
+                // The shape GNU tools use: version, then the notices the GPL
+                // asks for.
+                println!("packrat {}", packrat::VERSION);
+                println!("{}", packrat::COPYRIGHT);
+                println!("License GPLv3: GNU GPL version 3 <https://gnu.org/licenses/gpl.html>");
+                println!("This is free software: you are free to change and redistribute it.");
+                println!("There is NO WARRANTY, to the extent permitted by law.");
                 std::process::exit(0);
             }
             "-p" | "--port" => {
@@ -126,6 +133,16 @@ fn parse_args() -> Result<Args, String> {
 
 #[tokio::main]
 async fn main() {
+    // Rust ignores SIGPIPE, so writing into a closed pipe returns an error and
+    // println! panics. `packrat --version | head -1` failed roughly one time in
+    // ten that way, depending on whether the reader had exited yet. Restoring
+    // the default handler makes the process end quietly, the way every other
+    // command line tool does.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if let Err(message) = run().await {
         eprintln!("packrat: {message}");
         std::process::exit(1);

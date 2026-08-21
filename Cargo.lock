@@ -670,6 +670,7 @@ dependencies = [
  "axum",
  "criterion",
  "futures-core",
+ "libc",
  "mime_guess",
  "qrcode",
  "r2d2",

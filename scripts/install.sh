@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 # Installs Packrat and registers it to start at boot.
 #
 #   Linux (systemd) — a sandboxed system service under its own account when run
