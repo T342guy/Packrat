@@ -373,3 +373,8 @@ static/         frontend, embedded into the binary at compile time
 Dockerfile      two-stage build; the runtime image is Alpine plus the binary
 scripts/        install.sh — installs the binary and registers it to autostart
 ```
+
+## License
+
+GPL-3.0-only — see [LICENSE](LICENSE). The binaries in each release ship with
+the licence text alongside them.

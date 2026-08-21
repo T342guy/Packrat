@@ -123,7 +123,7 @@ jobs:
           name="packrat-${VERSION}-${TARGET}"
           mkdir -p "dist/$name"
           cp "target/${TARGET}/release/packrat" "dist/$name/"
-          cp README.md "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
           cp scripts/install.sh "dist/$name/"
           chmod +x "dist/$name/packrat" "dist/$name/install.sh"
 

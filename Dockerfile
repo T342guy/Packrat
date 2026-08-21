@@ -23,7 +23,7 @@ FROM alpine:3.21
 LABEL org.opencontainers.image.title="Packrat" \
       org.opencontainers.image.description="Self-hosted inventory for garages, sheds and storage" \
       org.opencontainers.image.source="https://github.com/T342guy/packrat" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="GPL-3.0-only"
 
 # Unprivileged by default. The uid is fixed so a bind-mounted data directory
 # can be chowned to match it from the host.
