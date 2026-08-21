@@ -29,8 +29,10 @@ docker run -d --name packrat --restart unless-stopped \
   ghcr.io/t342guy/packrat:latest
 ```
 
-Images are built for x86-64 and arm64, so the same command works on a Raspberry
-Pi. `PACKRAT_PUBLIC_URL` matters here: QR codes encode an absolute address, and
+Images are built for x86-64. On a Pi or another arm64 box, take the
+`aarch64` archive from the [releases](https://github.com/T342guy/packrat/releases)
+instead, or build the image yourself with `docker build -t packrat .`.
+`PACKRAT_PUBLIC_URL` matters here: QR codes encode an absolute address, and
 inside a container Packrat can only see its own container-network address, which
 no phone can reach — so tell it the host's address on your LAN. It says so on
 startup if you forget. There's a `docker-compose.yml` in the repo if you'd
@@ -323,8 +325,9 @@ a table; they do not gate the build, because runner timings are too noisy to
 fail on, but a regression is visible while the change is still in progress.
 
 **Container images** go to `ghcr.io/t342guy/packrat` from `main` and from `v*`
-tags, built for x86-64 and arm64. The arm64 half goes through emulation, so
-that job takes a while.
+tags, built for x86-64. Release archives additionally carry an arm64 binary for
+anyone running this on a Pi; the image is x86-64 only because building arm64
+images means emulation, which cost twenty-five minutes a push against three.
 
 **Releases** are cut automatically on every merge to `main`, or on demand from
 the Actions tab where you can choose whether to raise the patch, minor or major
