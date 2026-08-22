@@ -4,33 +4,50 @@ name: Pipeline
 # build, publish the release, then push the images. Nothing is published
 # unless the checks passed, and the release notes carry the benchmark
 # comparison against the previous release.
+#
+# What a run publishes depends on where it came from:
+#
+#   main, pushed        pre-release  0.1.4-pre1-2026.aug.22
+#   main, dispatched    production   0.1.4-2026.aug.22
+#   dev, pushed         pre-release  0.1.4-dev1-2026.aug.22
+#   a pull request      pre-release  0.1.4-claude.1-2026.aug.22
+#   anything else       built and checked, nothing published
+#
+# scripts/release-plan.sh holds those rules and is tested directly.
 
 on:
   push:
     # Every branch, so checks and benchmarks run wherever work happens.
-    # Only main and an explicit dispatch publish anything.
+    # What each branch publishes is decided by scripts/release-plan.sh.
   pull_request:
   workflow_dispatch:
     inputs:
+      release_type:
+        description: "Production release (main only), or a pre-release on this branch's channel"
+        type: choice
+        options: [production, prerelease]
+        default: production
       bump:
         description: "Which part of the version to raise"
         type: choice
         options: [patch, minor, major, none]
         default: patch
-      prerelease:
-        description: "Cut a pre-release (0.1.3-pre1-...) instead of a production release"
-        type: boolean
-        default: false
 
 permissions:
   contents: write
   packages: write
+  # So a push can find the open pull request its branch belongs to, and name
+  # the pre-release channel after whoever opened it.
+  pull-requests: read
 
 concurrency:
-  # Releases from main queue up behind each other; branch runs just supersede
-  # themselves, so a flurry of pushes does not tie up the runners.
+  # Runs on the two release branches queue up behind each other rather than
+  # cancelling, so a publish is never interrupted half way. Feature branches
+  # supersede themselves, so a flurry of pushes does not tie up the runners.
   group: pipeline-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: >-
+    ${{ !contains(fromJSON('["refs/heads/main", "refs/heads/master",
+                             "refs/heads/dev", "refs/heads/Dev"]'), github.ref) }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,6 +68,7 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       publish: ${{ steps.plan.outputs.publish }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
+      channel: ${{ steps.plan.outputs.channel }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,30 +76,48 @@ jobs:
 
       - id: plan
         name: Choose the version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
-          prerelease="${{ inputs.prerelease }}"
-          [[ "$prerelease" == "true" ]] || prerelease=false
 
-          publish=false
-          if [[ "$GITHUB_REF" == "refs/heads/main" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            publish=true
-          fi
-          # A push to main is always a production release. Pre-releases are
-          # deliberate, so they only come from a manual dispatch.
-          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
-            prerelease=false
+          # "A pull request branch" means one with an open pull request, and
+          # the channel is named after whoever opened it. On a push there is
+          # no PR in the event payload, so ask for it.
+          pr_author="$PR_USER"
+          if [[ -z "$pr_author" && "$EVENT" == "push" ]]; then
+            pr_author="$(gh pr list --head "$BRANCH" --state open \
+                           --json author --jq '.[0].author.login' 2>/dev/null || true)"
           fi
 
-          bump="${{ inputs.bump }}"
-          [[ -n "$bump" ]] || bump="patch"
-          # A dry build must not pretend to raise the version.
-          [[ "$publish" == "true" ]] || bump=none
+          plan="$(scripts/release-plan.sh \
+                    --event "$EVENT" --branch "$BRANCH" --actor "$ACTOR" \
+                    --pr-author "$pr_author" \
+                    --release-type "$RELEASE_TYPE" --bump "$BUMP")"
+          echo "$plan"
 
-          if [[ "$prerelease" == "true" ]]; then
-            version="$(scripts/next-version.sh "$bump" --prerelease)"
+          field() { grep -m1 "^$1=" <<< "$plan" | cut -d= -f2-; }
+          publish="$(field publish)"
+          prerelease="$(field prerelease)"
+          channel="$(field channel)"
+          bump="$(field bump)"
+
+          if [[ "$publish" == "true" ]]; then
+            if [[ -n "$channel" ]]; then
+              version="$(scripts/next-version.sh "$bump" --channel "$channel")"
+            else
+              version="$(scripts/next-version.sh "$bump")"
+            fi
           else
-            version="$(scripts/next-version.sh "$bump")"
+            # Nothing is tagged, but the build still stamps something so the
+            # archives and the image carry a coherent version.
+            version="$(scripts/next-version.sh none)"
           fi
 
           {
@@ -89,8 +125,9 @@ jobs:
             echo "tag=v$version"
             echo "publish=$publish"
             echo "prerelease=$prerelease"
+            echo "channel=$channel"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::${bump} bump -> ${version} (publish: ${publish}, prerelease: ${prerelease})"
+          echo "::notice::${version} — publish: ${publish}, channel: ${channel:-production}"
 
   checks:
     name: Format, lint and test
@@ -355,6 +392,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           set -euo pipefail
           previous="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
@@ -368,10 +406,16 @@ jobs:
 
           {
             if [[ "$PRERELEASE" == "true" ]]; then
-              echo "**Pre-release.** Packrat ${VERSION}, built $(date -u '+%d %B %Y')."
+              case "$CHANNEL" in
+                pre) origin='cut automatically from `main`' ;;
+                dev) origin='cut automatically from the `dev` branch' ;;
+                *)   origin="cut from a pull request by \`${CHANNEL}\`" ;;
+              esac
+              echo "**Pre-release** on the \`${CHANNEL}\` channel, ${origin}."
+              echo "Packrat ${VERSION}, built $(date -u '+%d %B %Y')."
               echo
-              echo 'This is a preview cut for testing. It does not change what the next'
-              echo 'production release will be numbered, and the `latest` container tag'
+              echo 'It does not change what the next production release will be numbered —'
+              echo 'that simply drops the channel part — and the `latest` container tag'
               echo 'still points at the last production release.'
             else
               echo "Packrat ${VERSION}, built $(date -u '+%d %B %Y')."
@@ -418,6 +462,7 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           set -euo pipefail
           assets=(artifacts/*.tar.gz artifacts/*.zip)
@@ -437,7 +482,7 @@ jobs:
           url="$(gh release view "$TAG" --json url --jq .url)"
           {
             if [[ "$PRERELEASE" == "true" ]]; then
-              echo "### 🧪 Pre-release [$VERSION]($url)"
+              echo "### 🧪 Pre-release [$VERSION]($url) on the \`$CHANNEL\` channel"
             else
               echo "### 🚀 Released [$VERSION]($url)"
             fi
@@ -474,19 +519,26 @@ jobs:
         run: scripts/stamp-version.sh "${{ needs.prepare.outputs.version }}"
 
       - name: Work out the image tags
-        # `latest` should only ever mean "the current production release", so
-        # neither a branch build nor a pre-release moves it.
+        # `latest` means the current production release and nothing else, so
+        # neither a branch build nor any pre-release channel moves it. The two
+        # standing channels get a moving tag of their own instead; a
+        # contributor's channel gets only its exact version.
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           set -euo pipefail
           tags="${IMAGE}:${VERSION}"
-          if [[ "$PRERELEASE" == "true" ]]; then
-            # A moving handle for testers, without touching `latest`.
-            tags="${tags}"$'\n'"${IMAGE}:prerelease"
-          elif [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            tags="${tags}"$'\n'"${IMAGE}:latest"
+          if [[ "$PUBLISH" == "true" ]]; then
+            if [[ "$PRERELEASE" != "true" ]]; then
+              tags="${tags}"$'\n'"${IMAGE}:latest"
+            elif [[ "$CHANNEL" == "pre" ]]; then
+              tags="${tags}"$'\n'"${IMAGE}:prerelease"
+            elif [[ "$CHANNEL" == "dev" ]]; then
+              tags="${tags}"$'\n'"${IMAGE}:dev"
+            fi
           fi
           {
             echo "TAGS<<TAGS_EOF"

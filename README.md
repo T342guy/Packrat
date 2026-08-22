@@ -339,21 +339,36 @@ Everything happens in one run per push: checks, benchmarks, version, build,
 release, image. There is no separate CI workflow — a green tick on a commit
 means the same run that would have released it was happy with it.
 
-On **any branch**, a push runs formatting, clippy with warnings denied, the
+On **every branch**, a push runs formatting, clippy with warnings denied, the
 unit tests, shellcheck over the release scripts and the bash embedded in the
 workflow itself, tests for the release tooling, a release build, a smoke test
 that starts the binary and queries it, the benchmarks, the packaging, and a
-container build. Nothing is bumped, tagged, pushed or published.
+container build.
 
-On **`main`**, the same run continues: it bumps the version, commits and tags
-it, publishes a GitHub release with the binaries, and pushes the image. The
-bump and the tag happen in the publish job, *after* the checks and every build
-have passed, so a failing run leaves no dangling tag and burns no version
-number.
+What that run *publishes* depends on where it came from:
 
-In order, a release:
+| Trigger | Cuts | Example |
+| --- | --- | --- |
+| Push to `main` | pre-release on the `pre` channel | `0.1.4-pre1-2026.aug.22` |
+| **Manual run on `main`** | **production release** | `0.1.4-2026.aug.22` |
+| Push to `dev` | pre-release on the `dev` channel | `0.1.4-dev1-2026.aug.22` |
+| Push to a branch with an open PR | pre-release named after whoever opened it | `0.1.4-claude.1-2026.aug.22` |
+| Push to any other branch | nothing — built and checked only | |
+| A pull request from a fork | nothing — untrusted code is never tagged | |
 
-1. works out the next version from the last production tag;
+Production releases are deliberately manual: cutting one is the single decision
+that needs a human to say whether it's a patch, a minor or a major. Run the
+pipeline from the Actions tab on `main`, leave **release_type** on
+`production`, and pick the **bump**. Asking for a production release from any
+other branch is refused rather than quietly downgraded — it would tag code that
+`main` has never seen.
+
+Everything else flows automatically, so `main` and `dev` always have a
+published build to point at without anyone cutting a release for it.
+
+In order, a publishing run:
+
+1. works out the version and the channel from the branch and the event;
 2. builds statically linked binaries for x86-64 and arm64 Linux, packaging each
    as both `.tar.gz` and `.zip` with the README, the licence and the installer
    alongside;
@@ -361,15 +376,29 @@ In order, a release:
 4. bumps `Cargo.toml`, commits it back, and tags it;
 5. publishes a GitHub release listing every commit since the previous tag, with
    the benchmark verdict, SHA-256 checksums, and `benchmarks.json` attached;
-6. builds the container image from the same commit and pushes it to
-   `ghcr.io/t342guy/packrat`, tagged with that version, plus `latest` from
-   `main`.
+6. builds the container image from the same commit and pushes it.
+
+The bump and the tag happen in the publish job, *after* the checks and every
+build have passed, so a failing run leaves no dangling tag and burns no version
+number.
 
 Keeping the image in the same run is the point: when it was a separate
 workflow, it built whatever `Cargo.toml` said at its own ref, so an image from
 `main` carried the version from *before* the bump. Now the release archives,
 the git tag and the image all name the same version, and the build asserts that
 the binary agrees before anything is published.
+
+### Container tags
+
+| Tag | Follows |
+| --- | --- |
+| `latest` | the last **production** release, and nothing else |
+| `prerelease` | the last `pre` release from `main` |
+| `dev` | the last `dev` release |
+| `0.1.4-claude.1-2026.aug.22` | that exact build — every release gets one |
+
+Contributor channels get only their exact version, so a pull request can never
+move a tag anyone is following.
 
 The image is x86-64 only because building arm64 images means emulation, which
 cost twenty-five minutes a push against three. Release archives still carry an
@@ -378,42 +407,45 @@ cost nothing.
 
 ### Version numbers
 
-Versions look like `0.1.1-2026.aug.21` — the semver part says what changed, the
-date says when it was built. The day is deliberately not zero-padded: semver
-forbids leading zeros in numeric pre-release identifiers, and cargo rejects
-`0.1.1-2026.aug.05` outright. `scripts/next-version.sh` computes it and can be
-run by hand to see what the next release would be called.
+Versions look like `0.1.4-2026.aug.22` — the semver part says what changed, the
+date says when it was built. Pre-releases insert a channel:
+`0.1.4-pre1-2026.aug.22`, `0.1.4-dev1-2026.aug.22`,
+`0.1.4-claude.1-2026.aug.22`. A production release is the same string with the
+channel part removed.
 
-### Pre-releases
+**Pre-releases never advance production numbering.** The base always comes from
+the last *production* tag, never the last tag of any kind, so `pre`, `dev` and
+every contributor channel can all be running against 0.1.4 at once and the next
+production release is still 0.1.4. Counters are per channel, so they advance
+independently and each one restarts at 1 once production ships.
 
-Run the pipeline from the Actions tab with **prerelease** ticked and it cuts
-`0.1.3-pre1-2026.aug.21` instead. Pre-releases are numbered from the last
-*production* tag, so cutting them never advances what the next production
-release will be called: `pre1` through `pre9` of 0.1.3 all still leave 0.1.3 as
-the next real release, which then simply drops the `preN` part. They can be cut
-from any branch.
+Two details that look inconsistent but aren't:
 
-A pre-release is deliberately inert:
+- **Days are not zero-padded, and channels are lowercased.** Semver forbids
+  leading zeros in numeric pre-release identifiers, and cargo rejects
+  `0.1.1-2026.aug.05` outright.
+- **`pre` and `dev` join straight onto their counter; a username takes a dot.**
+  Neither fixed channel can end in a digit, but a username can — `user1` with
+  counter 1 would read `user11`, which can't be parsed back. The dot is the
+  only thing separating them.
 
-- it is marked as a pre-release on GitHub, so it stays off the repository
-  header and out of "latest release";
-- it does not move the branch — only the tag is pushed, so `main` never carries
-  a `preN` version in `Cargo.toml`;
-- its image is tagged with the version and with `prerelease`; `latest` keeps
-  pointing at the last production release.
+Logins are sanitised into valid identifiers on the way in, so
+`dependabot[bot]` becomes the `dependabot-bot` channel.
 
 One wrinkle worth knowing: under strict semver ordering
-`0.1.3-pre1-2026.aug.21` sorts *above* `0.1.3-2026.aug.21`, because numeric
+`0.1.4-pre1-2026.aug.22` sorts *above* `0.1.4-2026.aug.22`, because numeric
 pre-release identifiers rank below alphanumeric ones and `2026` is numeric
 where `pre1-2026` is not. Both are valid semver and cargo accepts both. It
-does not matter here — nothing resolves Packrat by version range, and the
-`--prerelease` flag is what actually keeps previews out of the way — but a
-tool that sorts these strings will disagree with the pipeline about which came
-first.
+does not matter here — nothing resolves Packrat by version range, and marking
+the release as a pre-release on GitHub is what actually keeps previews out of
+the way — but a tool that sorts these strings will disagree with the pipeline
+about which came first.
 
-`scripts/test-next-version.sh` pins all of this down, including the case that
-matters most: given a history of `v0.1.2`, `v0.1.3-pre1` and `v0.1.3-pre2`, a
-production patch bump still yields `0.1.3`.
+`scripts/next-version.sh` computes any of these and can be run by hand;
+`scripts/release-plan.sh` holds the branch rules. Both are tested by
+`scripts/test-next-version.sh`, including the case that matters most: given a
+history of `v0.1.3` plus pre-releases on three channels, a production patch
+bump still yields `0.1.4`.
 
 ### Benchmarks in the release
 
@@ -422,7 +454,7 @@ per case — and attaches it to the release. The next release downloads the most
 recent one it can find and compares against it, so the release notes and the
 job summary both open with a verdict:
 
-> 🟢 **BETTER** against `0.1.2-2026.aug.20` — 3 cases got faster and nothing
+> 🟢 **BETTER** against `0.1.3-2026.aug.21` — 3 cases got faster and nothing
 > regressed. Overall -12.4% across 24 shared cases.
 
 A case only counts as moved when it clears both a flat 5% floor and the two
