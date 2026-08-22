@@ -127,7 +127,13 @@ jobs:
             echo "prerelease=$prerelease"
             echo "channel=$channel"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::${version} — publish: ${publish}, channel: ${channel:-production}"
+          if [[ "$publish" != "true" ]]; then
+            echo "::notice::${version} — built and checked, nothing published"
+          elif [[ -n "$channel" ]]; then
+            echo "::notice::${version} — pre-release on the ${channel} channel"
+          else
+            echo "::notice::${version} — production release"
+          fi
 
   checks:
     name: Format, lint and test
