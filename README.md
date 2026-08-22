@@ -335,23 +335,33 @@ it runs on, use `--host 127.0.0.1` (QR scanning from a phone won't work then).
 
 ## Builds and releases
 
-Every push, on any branch, runs formatting, clippy with warnings denied, the
-unit tests, a release build, a smoke test that starts the binary and queries
-it, and the benchmarks. Benchmark medians are published to the job summary as
-a table; they do not gate the build, because runner timings are too noisy to
-fail on, but a regression is visible while the change is still in progress.
+Everything happens in one run per push: checks, benchmarks, version, build,
+release, image. There is no separate CI workflow — a green tick on a commit
+means the same run that would have released it was happy with it.
 
-**Releases** are one pipeline, run on every merge to `main` or on demand from
-the Actions tab where you can choose whether to raise the patch, minor or major
-part. In order, it:
+On **any branch**, a push runs formatting, clippy with warnings denied, the
+unit tests, shellcheck over the release scripts and the bash embedded in the
+workflow itself, tests for the release tooling, a release build, a smoke test
+that starts the binary and queries it, the benchmarks, the packaging, and a
+container build. Nothing is bumped, tagged, pushed or published.
 
-1. works out the next version and bumps `Cargo.toml`, commits it back and tags it;
-2. builds statically linked binaries for x86-64 and arm64 Linux from that tag,
-   packaging each as both `.tar.gz` and `.zip` with the README, the licence and
-   the installer alongside;
-3. publishes a GitHub release listing every commit since the previous tag, with
-   SHA-256 checksums;
-4. builds the container image from the same commit and pushes it to
+On **`main`**, the same run continues: it bumps the version, commits and tags
+it, publishes a GitHub release with the binaries, and pushes the image. The
+bump and the tag happen in the publish job, *after* the checks and every build
+have passed, so a failing run leaves no dangling tag and burns no version
+number.
+
+In order, a release:
+
+1. works out the next version from the last production tag;
+2. builds statically linked binaries for x86-64 and arm64 Linux, packaging each
+   as both `.tar.gz` and `.zip` with the README, the licence and the installer
+   alongside;
+3. benchmarks the build and compares it against the previous release;
+4. bumps `Cargo.toml`, commits it back, and tags it;
+5. publishes a GitHub release listing every commit since the previous tag, with
+   the benchmark verdict, SHA-256 checksums, and `benchmarks.json` attached;
+6. builds the container image from the same commit and pushes it to
    `ghcr.io/t342guy/packrat`, tagged with that version, plus `latest` from
    `main`.
 
@@ -366,14 +376,61 @@ cost twenty-five minutes a push against three. Release archives still carry an
 arm64 binary for anyone running this on a Pi, since those build natively and
 cost nothing.
 
+### Version numbers
+
 Versions look like `0.1.1-2026.aug.21` — the semver part says what changed, the
 date says when it was built. The day is deliberately not zero-padded: semver
 forbids leading zeros in numeric pre-release identifiers, and cargo rejects
 `0.1.1-2026.aug.05` outright. `scripts/next-version.sh` computes it and can be
 run by hand to see what the next release would be called.
 
-Pushing to any other branch runs the same build and packaging without bumping,
-tagging or publishing anything, so the pipeline can be exercised safely.
+### Pre-releases
+
+Run the pipeline from the Actions tab with **prerelease** ticked and it cuts
+`0.1.3-pre1-2026.aug.21` instead. Pre-releases are numbered from the last
+*production* tag, so cutting them never advances what the next production
+release will be called: `pre1` through `pre9` of 0.1.3 all still leave 0.1.3 as
+the next real release, which then simply drops the `preN` part. They can be cut
+from any branch.
+
+A pre-release is deliberately inert:
+
+- it is marked as a pre-release on GitHub, so it stays off the repository
+  header and out of "latest release";
+- it does not move the branch — only the tag is pushed, so `main` never carries
+  a `preN` version in `Cargo.toml`;
+- its image is tagged with the version and with `prerelease`; `latest` keeps
+  pointing at the last production release.
+
+One wrinkle worth knowing: under strict semver ordering
+`0.1.3-pre1-2026.aug.21` sorts *above* `0.1.3-2026.aug.21`, because numeric
+pre-release identifiers rank below alphanumeric ones and `2026` is numeric
+where `pre1-2026` is not. Both are valid semver and cargo accepts both. It
+does not matter here — nothing resolves Packrat by version range, and the
+`--prerelease` flag is what actually keeps previews out of the way — but a
+tool that sorts these strings will disagree with the pipeline about which came
+first.
+
+`scripts/test-next-version.sh` pins all of this down, including the case that
+matters most: given a history of `v0.1.2`, `v0.1.3-pre1` and `v0.1.3-pre2`, a
+production patch bump still yields `0.1.3`.
+
+### Benchmarks in the release
+
+The bench job writes `benchmarks.json` — one median and one absolute deviation
+per case — and attaches it to the release. The next release downloads the most
+recent one it can find and compares against it, so the release notes and the
+job summary both open with a verdict:
+
+> 🟢 **BETTER** against `0.1.2-2026.aug.20` — 3 cases got faster and nothing
+> regressed. Overall -12.4% across 24 shared cases.
+
+A case only counts as moved when it clears both a flat 5% floor and the two
+runs' own measured spread; everything else is reported as noise rather than
+dressed up as a win. The overall figure is the geometric mean of the ratios,
+which is the honest way to average a set of speedups. Benchmarks never gate a
+release — shared runners are far too noisy for that — but a regression is now
+impossible to miss.
 
 ## Development
 
@@ -404,7 +461,7 @@ src/barcode.rs  Code 128 encoding
 src/backup.rs   export and import
 static/         frontend, embedded into the binary at compile time
 Dockerfile      two-stage build; the runtime image is Alpine plus the binary
-scripts/        install.sh — installs the binary and registers it to autostart
+scripts/        install.sh and the release tooling, all of it tested
 ```
 
 ## License

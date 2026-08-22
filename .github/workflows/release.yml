@@ -1,11 +1,15 @@
-name: Release
+name: Pipeline
+
+# One run per push does everything: check, benchmark, work out the version,
+# build, publish the release, then push the images. Nothing is published
+# unless the checks passed, and the release notes carry the benchmark
+# comparison against the previous release.
 
 on:
   push:
-    # Every merge to main cuts a release. Other branches run the same build,
-    # packaging and image build without publishing anything, so the pipeline
-    # can be exercised safely.
-    branches: [main, "claude/**"]
+    # Every branch, so checks and benchmarks run wherever work happens.
+    # Only main and an explicit dispatch publish anything.
+  pull_request:
   workflow_dispatch:
     inputs:
       bump:
@@ -13,27 +17,40 @@ on:
         type: choice
         options: [patch, minor, major, none]
         default: patch
+      prerelease:
+        description: "Cut a pre-release (0.1.3-pre1-...) instead of a production release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
   packages: write
 
 concurrency:
-  group: release
-  cancel-in-progress: false
+  # Releases from main queue up behind each other; branch runs just supersede
+  # themselves, so a flurry of pushes does not tie up the runners.
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   prepare:
     name: Work out the version
-    # The version bump commits back to main; without this it would trigger
-    # itself. GitHub also honours [skip ci] natively — belt and braces.
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    # The version bump commits back to main; without the guard it would
+    # trigger itself. A pull request from this same repository is already
+    # covered by its branch's push run, so skip the duplicate.
+    if: |
+      !contains(github.event.head_commit.message, '[skip ci]')
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
-      ref: ${{ steps.plan.outputs.ref }}
       publish: ${{ steps.plan.outputs.publish }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,44 +60,164 @@ jobs:
         name: Choose the version
         run: |
           set -euo pipefail
+          prerelease="${{ inputs.prerelease }}"
+          [[ "$prerelease" == "true" ]] || prerelease=false
+
           publish=false
           if [[ "$GITHUB_REF" == "refs/heads/main" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             publish=true
           fi
+          # A push to main is always a production release. Pre-releases are
+          # deliberate, so they only come from a manual dispatch.
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            prerelease=false
+          fi
+
           bump="${{ inputs.bump }}"
-          [[ -n "$bump" ]] || bump=patch
+          [[ -n "$bump" ]] || bump="patch"
           # A dry build must not pretend to raise the version.
           [[ "$publish" == "true" ]] || bump=none
 
-          version="$(scripts/next-version.sh "$bump")"
+          if [[ "$prerelease" == "true" ]]; then
+            version="$(scripts/next-version.sh "$bump" --prerelease)"
+          else
+            version="$(scripts/next-version.sh "$bump")"
+          fi
+
           {
             echo "version=$version"
             echo "tag=v$version"
             echo "publish=$publish"
+            echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
-          # Everything downstream builds this exact commit, so the binaries,
-          # the archives and the image are all the same code.
-          if [[ "$publish" == "true" ]]; then
-            echo "ref=v$version" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          fi
-          echo "::notice::${bump} bump -> ${version} (publish: ${publish})"
+          echo "::notice::${bump} bump -> ${version} (publish: ${publish}, prerelease: ${prerelease})"
 
-      - name: Bump, commit and tag
-        if: steps.plan.outputs.publish == 'true'
-        env:
-          VERSION: ${{ steps.plan.outputs.version }}
-          TAG: ${{ steps.plan.outputs.tag }}
+  checks:
+    name: Format, lint and test
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lints
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Shell scripts
+        # The release machinery is bash now, so it gets linted like the rest —
+        # including the bash that lives inside this very workflow.
+        run: |
+          shellcheck --severity=warning scripts/*.sh
+          ./scripts/lint-workflows.sh
+
+      - name: Release tooling
+        # The version arithmetic and the benchmark verdict both decide what
+        # ships, so they are tested rather than trusted.
+        run: |
+          ./scripts/test-next-version.sh
+          ./scripts/test-bench-tools.sh
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Smoke test the binary
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          scripts/stamp-version.sh "$VERSION"
-          git add Cargo.toml Cargo.lock
-          git commit -m "Release $VERSION [skip ci]"
-          git tag -a "$TAG" -m "Packrat $VERSION"
-          git push origin HEAD "$TAG"
+          ./target/release/packrat --db "$RUNNER_TEMP/ci.db" --port 8099 --seed-example &
+          server=$!
+          trap 'kill $server' EXIT
+          for _ in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8099/api/health >/dev/null 2>&1; then break; fi
+            sleep 0.25
+          done
+          curl -fsS http://127.0.0.1:8099/api/health
+          # The seeded inventory should be queryable end to end.
+          curl -fsS "http://127.0.0.1:8099/api/search?q=tent" | grep -q "4-person tent"
+          # And a label sheet should render, QR codes and all.
+          curl -fsS "http://127.0.0.1:8099/labels?format=dymo-30334&symbols=both" | grep -q "<svg"
+          echo "smoke test passed"
+
+      - name: Summary
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+        run: |
+          if [[ "$STATUS" == "success" ]]; then
+            echo "### ✅ Checks passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ❌ Checks failed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  bench:
+    name: Benchmarks
+    needs: prepare
+    # Runner timings are too noisy to gate a release on, so a blow-up here is
+    # reported rather than fatal. It still runs on every branch: a regression
+    # is worth knowing about while the change is in progress.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the benchmarks
+        run: cargo bench --bench inventory -- --warm-up-time 0.3 --measurement-time 1.0
+
+      - name: Collect the numbers
+        run: |
+          ./scripts/bench-report.sh \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --out benchmarks.json
+
+      - name: Fetch the previous release's numbers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Walk back through published releases until one carries a report.
+          # Early releases predate this file, and a release can be cut without
+          # one if the bench job failed that day.
+          for tag in $(gh release list --limit 20 --exclude-drafts \
+                         --json tagName --jq '.[].tagName' 2>/dev/null || true); do
+            if gh release download "$tag" --pattern benchmarks.json \
+                 --output previous.json 2>/dev/null; then
+              echo "comparing against $tag"
+              exit 0
+            fi
+          done
+          echo "no previous benchmark report found — this run becomes the baseline"
+
+      - name: Compare against the previous release
+        run: |
+          set -euo pipefail
+          # An `x && y=z` here would abort the step under `set -e` whenever
+          # there is no baseline, which is exactly the first-release case.
+          baseline=""
+          if [[ -f previous.json ]]; then baseline=previous.json; fi
+          ./scripts/bench-compare.sh "$baseline" benchmarks.json > bench-summary.md
+          cat bench-summary.md
+          cat bench-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: |
+            benchmarks.json
+            bench-summary.md
+          retention-days: 30
 
   build:
     name: ${{ matrix.target }}
@@ -96,8 +233,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -168,14 +303,47 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: [prepare, build]
-    if: needs.prepare.outputs.publish == 'true'
+    # Checks gate the release; benchmarks only inform it, which is why bench
+    # is continue-on-error rather than a dependency that can block.
+    needs: [prepare, checks, bench, build]
+    # Spelled out rather than left to `needs`: benchmarks inform the release,
+    # they do not gate it, so `bench` is absent from the condition on purpose.
+    if: |
+      always()
+      && needs.prepare.outputs.publish == 'true'
+      && needs.checks.result == 'success'
+      && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Bump, commit and tag
+        # Deliberately here and not in `prepare`: the version is only spent,
+        # and the tag only created, once the checks and every build have
+        # passed. A failing run leaves no dangling tag and burns no number.
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/stamp-version.sh "$VERSION"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release $VERSION [skip ci]"
+          git tag -a "$TAG" -m "Packrat $VERSION"
+          if [[ "$PRERELEASE" == "true" ]]; then
+            # A pre-release must not move the branch. The stamped version is
+            # throwaway, and leaving it on main would misreport the version
+            # every later build until the next production release. Pushing the
+            # tag carries the commit along, so the release is still complete.
+            git push origin "$TAG"
+          else
+            git push origin "HEAD:$GITHUB_REF" "$TAG"
+          fi
 
       - uses: actions/download-artifact@v4
         with:
@@ -186,6 +354,7 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
           previous="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
@@ -198,12 +367,27 @@ jobs:
           fi
 
           {
-            echo "Packrat ${VERSION}, built $(date -u '+%d %B %Y')."
+            if [[ "$PRERELEASE" == "true" ]]; then
+              echo "**Pre-release.** Packrat ${VERSION}, built $(date -u '+%d %B %Y')."
+              echo
+              echo 'This is a preview cut for testing. It does not change what the next'
+              echo 'production release will be numbered, and the `latest` container tag'
+              echo 'still points at the last production release.'
+            else
+              echo "Packrat ${VERSION}, built $(date -u '+%d %B %Y')."
+            fi
             echo
             echo "## ${heading}"
             echo
             git log --no-merges --pretty='- %s (`%h`)' "$range"
             echo
+
+            if [[ -f artifacts/bench-summary.md ]]; then
+              # bench-report writes an H3; the release notes want an H2.
+              sed 's/^### /## /' artifacts/bench-summary.md
+              echo
+            fi
+
             echo "## Install"
             echo
             echo 'Download the archive for your architecture, unpack it, and either run the'
@@ -233,14 +417,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" \
-            --title "Packrat $VERSION" \
-            --notes-file notes.md \
-            artifacts/*.tar.gz artifacts/*.zip
-          echo "### Released [$VERSION]($(gh release view "$TAG" --json url --jq .url))" \
-            >> "$GITHUB_STEP_SUMMARY"
+          assets=(artifacts/*.tar.gz artifacts/*.zip)
+          # Attached so the next release can compare itself against this one.
+          if [[ -f artifacts/benchmarks.json ]]; then
+            assets+=(artifacts/benchmarks.json)
+          fi
+
+          flags=(--title "Packrat $VERSION" --notes-file notes.md)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            # Keeps it out of "latest release" and off the repository header.
+            flags+=(--prerelease)
+          fi
+
+          gh release create "$TAG" "${flags[@]}" "${assets[@]}"
+
+          url="$(gh release view "$TAG" --json url --jq .url)"
+          {
+            if [[ "$PRERELEASE" == "true" ]]; then
+              echo "### 🧪 Pre-release [$VERSION]($url)"
+            else
+              echo "### 🚀 Released [$VERSION]($url)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Repeat the benchmark verdict
+        if: hashFiles('artifacts/bench-summary.md') != ''
+        run: cat artifacts/bench-summary.md >> "$GITHUB_STEP_SUMMARY"
 
   image:
     name: Container image
@@ -248,17 +453,16 @@ jobs:
     # `always()` lets this run on branch builds, where publish is skipped
     # rather than successful — there it validates the Dockerfile without
     # pushing anything.
-    needs: [prepare, build, publish]
+    needs: [prepare, checks, build, publish]
     if: |
       always()
       && needs.prepare.result == 'success'
+      && needs.checks.result == 'success'
       && needs.build.result == 'success'
       && needs.publish.result != 'failure'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.ref }}
 
       - name: Work out the image name
         # GHCR requires a lowercase image path; the repository name may not be.
@@ -270,12 +474,18 @@ jobs:
         run: scripts/stamp-version.sh "${{ needs.prepare.outputs.version }}"
 
       - name: Work out the image tags
-        # `latest` should only ever mean "the current main", so a manual run
-        # from a branch tags the version and nothing else.
+        # `latest` should only ever mean "the current production release", so
+        # neither a branch build nor a pre-release moves it.
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
-          tags="${IMAGE}:${{ needs.prepare.outputs.version }}"
-          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+          tags="${IMAGE}:${VERSION}"
+          if [[ "$PRERELEASE" == "true" ]]; then
+            # A moving handle for testers, without touching `latest`.
+            tags="${tags}"$'\n'"${IMAGE}:prerelease"
+          elif [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
             tags="${tags}"$'\n'"${IMAGE}:latest"
           fi
           {
@@ -311,16 +521,17 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Summary
+        env:
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
         run: |
           {
-            if [[ "${{ needs.prepare.outputs.publish }}" == "true" ]]; then
-              echo "### Image pushed"
+            if [[ "$PUBLISH" == "true" ]]; then
+              echo "### 📦 Image pushed"
               echo
               echo '```'
-              echo "${IMAGE}:${{ needs.prepare.outputs.version }}"
-              echo "${IMAGE}:latest"
+              echo "${TAGS}"
               echo '```'
             else
-              echo "### Image built, not pushed (branch build)"
+              echo "### 📦 Image built, not pushed (branch build)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
