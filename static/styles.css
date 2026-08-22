@@ -487,17 +487,47 @@ details.childbox > .list { border-top: 1px solid var(--border); }
 /* --------------------------------------------------------------- layout map
    A shelf drawn as it stands: levels down, slots across. The perspective is
    cosmetic — the model underneath is a flat grid, because that is all anyone
-   wants to type in. Depth is never asked for and never drawn to scale. */
+   wants to type in. Depth is never asked for and never drawn to scale.
 
-.shelf-wrap { perspective: 1100px; perspective-origin: 50% 30%; margin-bottom: 16px; }
+   Cells are sized between a floor and a ceiling rather than a share of the
+   width. Sharing the width meant a two-slot shelf drew metre-wide cells and a
+   twenty-four-slot one drew 34px slivers with the names clipped off; the
+   number of slots should change how much shelf there is, not how big a box
+   looks. Past the container width the shelf scrolls sideways instead. */
 
+.shelf-wrap {
+  /* One fixed cell size, not a share of the width. A box looks the same on
+     every shelf, which is the point: the slot count changes how much shelf
+     there is, never how big a box appears. */
+  --cell-w: 150px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 4px;
+  margin-bottom: 16px;
+  /* Keep the bar visible rather than letting the platform hide it: on a wide
+     shelf it is the only hint that there is more shelf off to the right. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.shelf-wrap::-webkit-scrollbar { height: 10px; }
+.shelf-wrap::-webkit-scrollbar-track { background: transparent; }
+.shelf-wrap::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 5px;
+}
+.shelf-wrap::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* No perspective tilt any more, deliberately: a transform on the shelf makes
+   it a containing block, which breaks the sticky level tags once a wide shelf
+   scrolls. Knowing which level you are looking at beats a decorative lean —
+   the boards, the gradient and the shadows still read as a shelf. */
 .shelf {
-  transform: rotateX(7deg);
-  transform-style: preserve-3d;
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 14px 12px 18px;
+  /* Only as wide as its cells need; a narrow shelf stays narrow. */
+  width: max-content;
+  min-width: 100%;
   background: linear-gradient(180deg, var(--surface-2), var(--surface));
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -512,12 +542,18 @@ details.childbox > .list { border-top: 1px solid var(--border); }
   font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
   color: var(--muted);
   border-right: 1px dashed var(--border);
+  /* Stays put while a wide shelf scrolls, so you never lose which level
+     you are looking at. */
+  position: sticky;
+  left: 0;
+  background: var(--surface-2);
+  z-index: 1;
 }
 
 .shelf-cells {
-  flex: 1;
   display: grid;
-  grid-template-columns: repeat(var(--slots), minmax(0, 1fr));
+  grid-template-columns: repeat(var(--slots), var(--cell-w));
+  justify-content: start;
   gap: 6px;
   padding-bottom: 8px;
   /* The board each level sits on. */
@@ -526,7 +562,7 @@ details.childbox > .list { border-top: 1px solid var(--border); }
 }
 
 .cell {
-  min-height: 62px;
+  min-height: 76px;
   border-radius: 8px;
   border: 1px solid var(--border);
   padding: 6px;
@@ -585,7 +621,6 @@ details.childbox > .list { border-top: 1px solid var(--border); }
 /* Motion is decoration here; the border and the dimming already say which
    cell it is, so a reduced-motion reader loses nothing. */
 @media (prefers-reduced-motion: reduce) {
-  .shelf { transform: none; }
   .cell.located { animation: none; }
   .cell, .cell.filled:hover { transition: none; transform: none; }
 }
@@ -599,16 +634,70 @@ details.childbox > .list { border-top: 1px solid var(--border); }
   color: var(--accent);
 }
 
-.unplaced-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.unplaced-strip {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px;
+  min-height: 40px; align-items: center;
+  padding: 6px; border-radius: 10px;
+  border: 1px dashed transparent;
+}
 .unplaced-strip .chip {
   border: 1px dashed var(--border); border-radius: 999px;
-  padding: 4px 10px; font-size: 12px; cursor: pointer; background: var(--surface);
+  padding: 5px 11px; font-size: 12px; background: var(--surface);
 }
-.unplaced-strip .chip:hover { border-color: var(--accent); color: var(--accent); }
+.unplaced-strip .chip.ghost-hint { color: var(--muted); font-style: italic; border-style: dotted; }
+
+/* ------------------------------------------------------------------ drag */
+
+.draggable {
+  cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none; user-select: none;
+  -webkit-user-drag: none;
+}
+.draggable:active { cursor: grabbing; }
+body.dragging { cursor: grabbing; -webkit-user-select: none; user-select: none; }
+
+/* The thing being dragged stays in place, greyed, so the grid does not
+   reflow under the pointer mid-drag. */
+.drag-source { opacity: .35; }
+
+.drag-ghost {
+  position: fixed; top: 0; left: 0; z-index: 1000;
+  /* Below and right of the pointer, so it never covers the cell you are
+     aiming at — the target's highlight is the feedback that matters. */
+  margin: 14px 0 0 16px;
+  pointer-events: none;
+  max-width: 150px;
+  padding: 7px 11px; border-radius: 8px;
+  background: var(--accent); color: var(--accent-text);
+  font: 600 12px/1.2 system-ui, sans-serif;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .3);
+}
+
+.cell.drop-hover {
+  border-color: var(--accent);
+  border-style: solid;
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+  color: var(--accent);
+  transform: scale(1.03);
+}
+/* An occupied cell says "we will trade places" rather than "drop here". */
+.cell.filled.drop-hover::after {
+  content: '⇄';
+  position: absolute; align-self: center;
+  font-size: 22px; color: var(--accent);
+}
+.cell.filled.drop-hover { position: relative; }
+
+.unplaced-strip.drop-hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
 
 @media (max-width: 560px) {
-  .shelf-wrap { perspective: none; }
-  .shelf { transform: none; }
-  .cell { min-height: 54px; }
-  .cell .cell-name { -webkit-line-clamp: 1; }
+  /* A phone gets slightly smaller cells and scrolls sooner, rather than
+     cramming every slot on screen at an unreadable size. */
+  .shelf-wrap { --cell-w: 118px; }
+  .cell { min-height: 68px; }
 }

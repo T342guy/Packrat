@@ -145,9 +145,25 @@ Depth, height and real measurements are exactly the data nobody keeps up to
 date, so the app never asks for them. The slight perspective on the drawing is
 cosmetic; the model underneath is a flat grid.
 
-To set one up, open a shelf and choose **Map this out as a shelf**. Then either
-pick an unplaced box and click a slot, or click an empty slot and choose what
-goes in it. From a box, **Move it** offers every free slot on its shelf.
+To set one up, open a shelf and choose **Map this out as a shelf**. After that
+everything is dragging — there are no dialogs:
+
+| Drag a box onto | What happens |
+| --- | --- |
+| an empty slot | it goes there |
+| another box | the two trade places |
+| the loose strip above the shelf | it comes off the grid, staying on the shelf |
+
+Dragging works with a mouse and with a finger. On touch it takes a short press
+first, because otherwise there would be no way to scroll a wide shelf sideways.
+A plain tap still opens the box. Drag past either edge of a wide shelf and it
+scrolls along with you.
+
+Cells are a fixed size rather than a share of the page width, so a box looks
+the same on a two-slot shelf as on a twenty-four-slot one; the slot count
+changes how much shelf there is, not how big a box appears. Past the width of
+the page the shelf scrolls, with the level markers pinned to the left so you
+never lose which row you are looking at.
 
 A few rules the app enforces so the map cannot quietly go wrong:
 

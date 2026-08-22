@@ -679,7 +679,12 @@ pub fn set_grid(conn: &Connection, id: i64, input: &GridInput) -> AppResult<Cont
 }
 
 /// Puts a container in one of its parent's slots, or takes it out of the grid.
-pub fn set_position(conn: &Connection, id: i64, input: &PositionInput) -> AppResult<Container> {
+///
+/// With `swap`, landing on an occupied slot trades places with the occupant
+/// rather than failing. The trade runs in one transaction and frees the slot
+/// before claiming it, so the unique index is never momentarily violated and
+/// a failure part-way cannot leave one box in two places or none.
+pub fn set_position(conn: &mut Connection, id: i64, input: &PositionInput) -> AppResult<Container> {
     let me = container_by_id(conn, id)?;
     match (input.level, input.slot) {
         (None, None) => {
@@ -710,26 +715,63 @@ pub fn set_position(conn: &Connection, id: i64, input: &PositionInput) -> AppRes
                     grid.slots
                 )));
             }
-            let taken: Option<String> = conn
+            let occupant: Option<(i64, String)> = conn
                 .query_row(
-                    "SELECT name FROM containers
+                    "SELECT id, name FROM containers
                       WHERE parent_id = ?1 AND pos_level = ?2 AND pos_slot = ?3 AND id <> ?4",
                     params![parent_id, level, slot, id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            if let Some(name) = taken {
-                return Err(AppError::bad_request(format!(
-                    "{} is already taken by {name}",
-                    position_label(level, slot)
-                )));
+
+            match occupant {
+                Some((_, name)) if !input.swap => {
+                    return Err(AppError::bad_request(format!(
+                        "{} is already taken by {name}",
+                        position_label(level, slot)
+                    )));
+                }
+                Some((other, _)) => {
+                    // Where the mover came from is where the occupant goes.
+                    // That may be nowhere, which simply turns the swap into a
+                    // displacement — the occupant comes off the grid.
+                    let vacated = me.position.as_ref().map(|p| (p.level, p.slot));
+                    let tx = conn.transaction()?;
+                    tx.execute(
+                        "UPDATE containers SET pos_level = NULL, pos_slot = NULL WHERE id = ?1",
+                        [id],
+                    )?;
+                    match vacated {
+                        Some((from_level, from_slot)) => tx.execute(
+                            "UPDATE containers
+                                SET pos_level = ?2, pos_slot = ?3, updated_at = datetime('now')
+                              WHERE id = ?1",
+                            params![other, from_level, from_slot],
+                        )?,
+                        None => tx.execute(
+                            "UPDATE containers
+                                SET pos_level = NULL, pos_slot = NULL, updated_at = datetime('now')
+                              WHERE id = ?1",
+                            [other],
+                        )?,
+                    };
+                    tx.execute(
+                        "UPDATE containers
+                            SET pos_level = ?2, pos_slot = ?3, updated_at = datetime('now')
+                          WHERE id = ?1",
+                        params![id, level, slot],
+                    )?;
+                    tx.commit()?;
+                }
+                None => {
+                    conn.execute(
+                        "UPDATE containers
+                            SET pos_level = ?2, pos_slot = ?3, updated_at = datetime('now')
+                          WHERE id = ?1",
+                        params![id, level, slot],
+                    )?;
+                }
             }
-            conn.execute(
-                "UPDATE containers
-                    SET pos_level = ?2, pos_slot = ?3, updated_at = datetime('now')
-                  WHERE id = ?1",
-                params![id, level, slot],
-            )?;
         }
         _ => {
             return Err(AppError::bad_request(
@@ -2096,25 +2138,38 @@ mod tests {
         )
     }
 
-    fn place(conn: &Connection, id: i64, level: i64, slot: i64) -> AppResult<Container> {
+    fn place(conn: &mut Connection, id: i64, level: i64, slot: i64) -> AppResult<Container> {
         set_position(
             conn,
             id,
             &PositionInput {
                 level: Some(level),
                 slot: Some(slot),
+                swap: false,
+            },
+        )
+    }
+
+    fn swap_into(conn: &mut Connection, id: i64, level: i64, slot: i64) -> AppResult<Container> {
+        set_position(
+            conn,
+            id,
+            &PositionInput {
+                level: Some(level),
+                slot: Some(slot),
+                swap: true,
             },
         )
     }
 
     #[test]
     fn a_shelf_can_be_given_a_layout_and_a_box_a_slot() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
 
         assert!(grid(&conn, shelf.id, 3, 4).unwrap().grid.is_some());
-        let placed = place(&conn, bx.id, 1, 1).unwrap();
+        let placed = place(&mut conn, bx.id, 1, 1).unwrap();
         let pos = placed.position.expect("placed");
         assert_eq!((pos.level, pos.slot), (1, 1));
         assert_eq!(pos.label, "L-1:1", "the form you would write on a label");
@@ -2122,14 +2177,14 @@ mod tests {
 
     #[test]
     fn a_slot_holds_one_thing() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let first = container(&conn, "Camping", "box", Some(shelf.id));
         let second = container(&conn, "Tools", "box", Some(shelf.id));
         grid(&conn, shelf.id, 2, 2).unwrap();
-        place(&conn, first.id, 1, 1).unwrap();
+        place(&mut conn, first.id, 1, 1).unwrap();
 
-        let clash = place(&conn, second.id, 1, 1).unwrap_err().to_string();
+        let clash = place(&mut conn, second.id, 1, 1).unwrap_err().to_string();
         assert!(clash.contains("already taken"), "{clash}");
         assert!(
             clash.contains("Camping"),
@@ -2139,53 +2194,55 @@ mod tests {
 
     #[test]
     fn a_slot_has_to_exist() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
         grid(&conn, shelf.id, 2, 3).unwrap();
 
         for (level, slot) in [(3, 1), (1, 4), (0, 1), (1, 0)] {
-            let err = place(&conn, bx.id, level, slot).unwrap_err().to_string();
+            let err = place(&mut conn, bx.id, level, slot)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("outside"), "L-{level}:{slot} -> {err}");
         }
     }
 
     #[test]
     fn a_slot_needs_a_shelf_with_a_layout() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
-        let err = place(&conn, bx.id, 1, 1).unwrap_err().to_string();
+        let err = place(&mut conn, bx.id, 1, 1).unwrap_err().to_string();
         assert!(err.contains("no layout yet"), "{err}");
 
         let loose = container(&conn, "Stray", "box", None);
-        let err = place(&conn, loose.id, 1, 1).unwrap_err().to_string();
+        let err = place(&mut conn, loose.id, 1, 1).unwrap_err().to_string();
         assert!(err.contains("not inside anything"), "{err}");
     }
 
     #[test]
     fn a_layout_cannot_shrink_under_something() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
         grid(&conn, shelf.id, 3, 4).unwrap();
-        place(&conn, bx.id, 3, 4).unwrap();
+        place(&mut conn, bx.id, 3, 4).unwrap();
 
         let err = grid(&conn, shelf.id, 2, 2).unwrap_err().to_string();
         assert!(err.contains("placed outside"), "{err}");
         // Growing is always fine, and shrinking works once it is out of range.
         grid(&conn, shelf.id, 6, 8).unwrap();
-        place(&conn, bx.id, 1, 1).unwrap();
+        place(&mut conn, bx.id, 1, 1).unwrap();
         assert!(grid(&conn, shelf.id, 2, 2).is_ok());
     }
 
     #[test]
     fn removing_a_layout_strands_nothing() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
         grid(&conn, shelf.id, 2, 2).unwrap();
-        place(&conn, bx.id, 2, 2).unwrap();
+        place(&mut conn, bx.id, 2, 2).unwrap();
 
         set_grid(
             &conn,
@@ -2204,12 +2261,12 @@ mod tests {
 
     #[test]
     fn moving_a_box_gives_up_its_slot() {
-        let conn = test_db();
+        let mut conn = test_db();
         let first = container(&conn, "North wall", "shelf", None);
         let second = container(&conn, "South wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(first.id));
         grid(&conn, first.id, 2, 2).unwrap();
-        place(&conn, bx.id, 2, 2).unwrap();
+        place(&mut conn, bx.id, 2, 2).unwrap();
 
         update_container(
             &conn,
@@ -2241,7 +2298,7 @@ mod tests {
         let shelf = container(&conn, "North wall", "shelf", Some(area.id));
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
         grid(&conn, shelf.id, 2, 2).unwrap();
-        place(&conn, bx.id, 1, 2).unwrap();
+        place(&mut conn, bx.id, 1, 2).unwrap();
 
         // Without clearing the slot this trips the unique index, or worse,
         // silently claims L-1:2 of whatever the box lands in.
@@ -2253,7 +2310,7 @@ mod tests {
 
     #[test]
     fn two_shelves_can_use_the_same_coordinates() {
-        let conn = test_db();
+        let mut conn = test_db();
         let first = container(&conn, "North wall", "shelf", None);
         let second = container(&conn, "South wall", "shelf", None);
         let a = container(&conn, "Camping", "box", Some(first.id));
@@ -2261,18 +2318,18 @@ mod tests {
         grid(&conn, first.id, 2, 2).unwrap();
         grid(&conn, second.id, 2, 2).unwrap();
 
-        place(&conn, a.id, 1, 1).unwrap();
-        place(&conn, b.id, 1, 1).expect("L-1:1 is per shelf, not global");
+        place(&mut conn, a.id, 1, 1).unwrap();
+        place(&mut conn, b.id, 1, 1).expect("L-1:1 is per shelf, not global");
     }
 
     #[test]
     fn a_grid_renders_every_cell_including_the_empty_ones() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
         let spare = container(&conn, "Unplaced", "box", Some(shelf.id));
         grid(&conn, shelf.id, 2, 3).unwrap();
-        place(&conn, bx.id, 2, 3).unwrap();
+        place(&mut conn, bx.id, 2, 3).unwrap();
 
         let detail = container_detail(&conn, shelf.id).unwrap();
         let view = detail.grid.expect("the shelf draws itself");
@@ -2288,11 +2345,11 @@ mod tests {
 
     #[test]
     fn a_box_is_told_where_it_sits_on_its_shelf() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
         grid(&conn, shelf.id, 3, 3).unwrap();
-        place(&conn, bx.id, 2, 1).unwrap();
+        place(&mut conn, bx.id, 2, 1).unwrap();
 
         // The box's own page needs the shelf drawn, with itself lit up, and
         // should not have to fetch the shelf separately to do it.
@@ -2309,6 +2366,118 @@ mod tests {
         assert!(
             detail.grid.is_none(),
             "a plain box has no layout of its own"
+        );
+    }
+
+    #[test]
+    fn dropping_one_box_onto_another_trades_places() {
+        let mut conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let a = container(&conn, "Camping", "box", Some(shelf.id));
+        let b = container(&conn, "Tools", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&mut conn, a.id, 1, 1).unwrap();
+        place(&mut conn, b.id, 2, 2).unwrap();
+
+        swap_into(&mut conn, a.id, 2, 2).unwrap();
+        let (a_after, b_after) = (
+            container_by_id(&conn, a.id).unwrap(),
+            container_by_id(&conn, b.id).unwrap(),
+        );
+        assert_eq!(a_after.position.unwrap().label, "L-2:2");
+        assert_eq!(b_after.position.unwrap().label, "L-1:1", "they traded");
+    }
+
+    #[test]
+    fn swapping_in_an_unplaced_box_displaces_the_occupant() {
+        let mut conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let loose = container(&conn, "Camping", "box", Some(shelf.id));
+        let sitting = container(&conn, "Tools", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&mut conn, sitting.id, 1, 1).unwrap();
+
+        // The mover has no slot to give, so the occupant comes off the grid
+        // rather than inheriting a position that does not exist.
+        swap_into(&mut conn, loose.id, 1, 1).unwrap();
+        assert_eq!(
+            container_by_id(&conn, loose.id)
+                .unwrap()
+                .position
+                .unwrap()
+                .label,
+            "L-1:1"
+        );
+        assert_eq!(container_by_id(&conn, sitting.id).unwrap().position, None);
+    }
+
+    #[test]
+    fn a_swap_never_leaves_one_box_in_two_slots() {
+        let mut conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let a = container(&conn, "Camping", "box", Some(shelf.id));
+        let b = container(&conn, "Tools", "box", Some(shelf.id));
+        let c = container(&conn, "Paint", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&mut conn, a.id, 1, 1).unwrap();
+        place(&mut conn, b.id, 1, 2).unwrap();
+        place(&mut conn, c.id, 2, 1).unwrap();
+
+        for _ in 0..6 {
+            swap_into(&mut conn, a.id, 1, 2).unwrap();
+            swap_into(&mut conn, a.id, 2, 1).unwrap();
+        }
+
+        // After all that shuffling every box still holds exactly one slot and
+        // no slot holds two boxes.
+        let view = container_detail(&conn, shelf.id).unwrap().grid.unwrap();
+        let occupied: Vec<&str> = view
+            .cells
+            .iter()
+            .filter_map(|c| c.container.as_ref().map(|x| x.name.as_str()))
+            .collect();
+        assert_eq!(occupied.len(), 3, "three boxes, three cells: {occupied:?}");
+        let mut sorted = occupied.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "no box appears twice: {occupied:?}");
+        assert!(view.unplaced.is_empty(), "nobody fell off the shelf");
+    }
+
+    #[test]
+    fn a_swap_still_refuses_a_slot_that_does_not_exist() {
+        let mut conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let a = container(&conn, "Camping", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&mut conn, a.id, 1, 1).unwrap();
+
+        let err = swap_into(&mut conn, a.id, 9, 9).unwrap_err().to_string();
+        assert!(err.contains("outside"), "{err}");
+        assert_eq!(
+            container_by_id(&conn, a.id)
+                .unwrap()
+                .position
+                .unwrap()
+                .label,
+            "L-1:1",
+            "a refused move changes nothing"
+        );
+    }
+
+    #[test]
+    fn without_the_swap_flag_an_occupied_slot_is_still_refused() {
+        let mut conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let a = container(&conn, "Camping", "box", Some(shelf.id));
+        let b = container(&conn, "Tools", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&mut conn, a.id, 1, 1).unwrap();
+        place(&mut conn, b.id, 2, 2).unwrap();
+
+        assert!(
+            place(&mut conn, a.id, 2, 2).is_err(),
+            "default stays strict"
         );
     }
 
@@ -2332,17 +2501,18 @@ mod tests {
 
     #[test]
     fn half_a_coordinate_is_refused() {
-        let conn = test_db();
+        let mut conn = test_db();
         let shelf = container(&conn, "North wall", "shelf", None);
         let bx = container(&conn, "Camping", "box", Some(shelf.id));
         grid(&conn, shelf.id, 2, 2).unwrap();
 
         let err = set_position(
-            &conn,
+            &mut conn,
             bx.id,
             &PositionInput {
                 level: Some(1),
                 slot: None,
+                swap: false,
             },
         )
         .unwrap_err()

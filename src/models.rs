@@ -220,4 +220,10 @@ pub struct PositionInput {
     pub level: Option<i64>,
     #[serde(default)]
     pub slot: Option<i64>,
+    /// Trade places with whatever is already in the slot instead of refusing.
+    /// Off by default: dropping one box onto another is an unambiguous
+    /// gesture, but a bare API call landing on an occupied slot is far more
+    /// likely to be a mistake than a swap request.
+    #[serde(default)]
+    pub swap: bool,
 }

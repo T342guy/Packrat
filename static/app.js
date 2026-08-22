@@ -335,20 +335,28 @@ async function viewBox(key) {
   // Where this thing physically is, drawn as the shelf it sits on with its
   // own slot lit up. This is the whole point of the feature: you should not
   // have to read a coordinate and translate it in your head.
+  // The shelf this thing sits on, which is where its slot can be changed.
+  const shelfCode = detail.ancestors.length
+    ? detail.ancestors[detail.ancestors.length - 1].code
+    : null;
+  const openShelf = shelfCode
+    ? `<a class="tiny btn" href="#/box/${encodeURIComponent(shelfCode)}">Open the shelf to rearrange</a>`
+    : '';
+
   const whereCard = detail.parent_grid && c.position
     ? `<h2>Where it is</h2>
        <div class="shelf-legend">
          <span class="coord">${esc(c.position.label)}</span>
          on ${esc(detail.parent_grid.container_name)} —
          level ${c.position.level} from the top, slot ${c.position.slot} from the left.
-         <button class="tiny" data-act="place-box" data-id="${c.id}">Move it</button>
+         ${openShelf}
        </div>
        ${shelfMap(detail.parent_grid, { locateId: c.id, interactive: false })}`
     : detail.parent_grid
       ? `<h2>Where it is</h2>
          <div class="shelf-legend">
-           Not placed on ${esc(detail.parent_grid.container_name)} yet.
-           <button class="tiny primary" data-act="place-box" data-id="${c.id}">Put it in a slot</button>
+           Not placed on ${esc(detail.parent_grid.container_name)} yet —
+           drag it into a slot from there. ${openShelf}
          </div>`
       : '';
 
@@ -440,22 +448,26 @@ async function viewBox(key) {
  */
 function shelfMap(grid, options = {}) {
   const { locateId = null, interactive = true } = options;
+  const dragAttrs = interactive ? ` data-grid="${grid.container_id}"` : '';
   const levels = [];
   for (let level = 1; level <= grid.levels; level++) {
     const cells = grid.cells
       .filter((cell) => cell.level === level)
       .map((cell) => {
         const box = cell.container;
+        const slotAttrs = `data-level="${cell.level}" data-slot="${cell.slot}"`;
         if (!box) {
           return interactive
-            ? `<div class="cell empty" data-act="place-here" data-parent="${grid.container_id}"
-                    data-level="${cell.level}" data-slot="${cell.slot}"
-                    title="Put something in ${esc(cell.label)}">${cell.slot}</div>`
+            ? `<div class="cell empty drop-target" ${slotAttrs}
+                    title="${esc(cell.label)} — drag a box here">${cell.slot}</div>`
             : `<div class="cell empty">${cell.slot}</div>`;
         }
         const located = locateId && box.id === locateId;
-        return `<a class="cell filled${located ? ' located' : ''}${box.stale ? ' is-stale' : ''}"
+        return `<a class="cell filled${located ? ' located' : ''}${box.stale ? ' is-stale' : ''}${
+                     interactive ? ' drop-target draggable' : ''}"
                    href="#/box/${encodeURIComponent(box.code)}"
+                   ${interactive ? `data-drag-id="${box.id}" data-drag-name="${esc(box.name)}" draggable="false"` : ''}
+                   ${slotAttrs}
                    title="${esc(cell.label)} — ${esc(box.name)}">
                   <span class="cell-code">${esc(box.code)}</span>
                   <span class="cell-name">${esc(box.name)}</span>
@@ -468,25 +480,200 @@ function shelfMap(grid, options = {}) {
         <div class="shelf-cells" style="--slots:${grid.slots}">${cells}</div>
       </div>`);
   }
-  return `<div class="shelf-wrap">
+  return `<div class="shelf-wrap"${dragAttrs}>
       <div class="shelf${locateId ? ' locating' : ''}">${levels.join('')}</div>
     </div>`;
 }
 
 /** The chips for children that are on the shelf but not in a numbered slot. */
 function unplacedStrip(grid) {
-  if (!grid.unplaced.length) return '';
-  return `<div class="shelf-legend">Not placed yet — pick one, then choose a slot:</div>
-    <div class="unplaced-strip">
+  return `<div class="shelf-legend">
+      ${grid.unplaced.length
+        ? 'Not on the shelf yet — drag one into a slot:'
+        : 'Drag a box here to take it off the shelf.'}
+    </div>
+    <div class="unplaced-strip drop-target" data-unplace="1" data-grid="${grid.container_id}">
       ${grid.unplaced
-        .map((c) => `<button class="chip" data-act="pick-unplaced" data-id="${c.id}"
-                       data-name="${esc(c.name)}">${esc(c.code)} · ${esc(c.name)}</button>`)
-        .join('')}
+        .map((c) => `<span class="chip draggable" data-drag-id="${c.id}"
+                       data-drag-name="${esc(c.name)}">${esc(c.code)} · ${esc(c.name)}</span>`)
+        .join('')
+        || '<span class="chip ghost-hint">nothing loose</span>'}
     </div>`;
 }
 
-/** The box currently waiting to be dropped into a slot, if any. */
-let pendingPlacement = null;
+
+/* ------------------------------------------------------------------ drag
+   Moving a box means dragging it, which is the gesture the thing itself
+   suggests. Built on pointer events rather than HTML5 drag-and-drop because
+   that API does not fire on touch at all, and this gets used on a phone in a
+   garage as much as on the machine by the door.
+
+   Drops land as:
+     empty cell     put it there
+     occupied cell  trade places
+     the loose strip take it off the shelf
+*/
+const drag = {
+  id: null, name: '', from: null, ghost: null, over: null,
+  pointer: 0, armed: false, startX: 0, startY: 0, timer: null,
+};
+
+/** Distance before a mouse press counts as a drag rather than a click. */
+const DRAG_SLOP = 6;
+/** A touch has to rest this long first, or the shelf could never be scrolled. */
+const TOUCH_HOLD_MS = 180;
+
+function dragCancel() {
+  clearTimeout(drag.timer);
+  if (drag.ghost) drag.ghost.remove();
+  document.querySelectorAll('.drop-hover').forEach((el) => el.classList.remove('drop-hover'));
+  document.querySelectorAll('.drag-source').forEach((el) => el.classList.remove('drag-source'));
+  document.body.classList.remove('dragging');
+  Object.assign(drag, { id: null, from: null, ghost: null, over: null, armed: false, timer: null });
+}
+
+function dragStart(event, handle) {
+  drag.id = Number(handle.dataset.dragId);
+  drag.name = handle.dataset.dragName || 'that box';
+  drag.from = handle;
+  drag.pointer = event.pointerId;
+  drag.startX = event.clientX;
+  drag.startY = event.clientY;
+  drag.armed = false;
+  clearTimeout(drag.timer);
+  if (event.pointerType === 'mouse') {
+    drag.armed = true;              // a mouse only needs to move DRAG_SLOP
+  } else {
+    // Give the finger a moment to mean "drag" rather than "scroll".
+    drag.timer = setTimeout(() => {
+      if (drag.id !== null) {
+        drag.armed = true;
+        dragEngage();
+      }
+    }, TOUCH_HOLD_MS);
+  }
+}
+
+function dragEngage() {
+  if (drag.ghost || !drag.from) return;
+  document.body.classList.add('dragging');
+  drag.from.classList.add('drag-source');
+  const ghost = document.createElement('div');
+  ghost.className = 'drag-ghost';
+  ghost.textContent = drag.name;
+  document.body.appendChild(ghost);
+  drag.ghost = ghost;
+  if (navigator.vibrate) navigator.vibrate(8);
+}
+
+/** The drop target under the pointer, if it is one this drag can use. */
+function dropTargetAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return null;
+  const target = el.closest('.drop-target');
+  if (!target || target === drag.from) return null;
+  // Only within the grid the drag started in: a slot means nothing on another
+  // shelf, and the server would refuse it anyway. Compare the id rather than
+  // the element — the loose strip carries its own data-grid, so identity would
+  // rule out the one target that means "off the shelf".
+  const home = drag.from.closest('[data-grid]');
+  const into = target.closest('[data-grid]');
+  return home && into && into.dataset.grid === home.dataset.grid ? target : null;
+}
+
+/** Nudge a wide shelf along when the pointer reaches its edge. */
+function dragAutoScroll(x) {
+  const wrap = drag.from && drag.from.closest('.shelf-wrap');
+  if (!wrap || wrap.scrollWidth <= wrap.clientWidth) return;
+  const box = wrap.getBoundingClientRect();
+  const edge = 48;
+  if (x < box.left + edge) wrap.scrollLeft -= 12;
+  else if (x > box.right - edge) wrap.scrollLeft += 12;
+}
+
+document.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 && event.pointerType === 'mouse') return;
+  const handle = event.target.closest('.draggable');
+  if (!handle) return;
+  dragStart(event, handle);
+});
+
+document.addEventListener('pointermove', (event) => {
+  if (drag.id === null || event.pointerId !== drag.pointer) return;
+  const moved = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+
+  if (!drag.ghost) {
+    // Still deciding. A finger that moves before the hold elapses was
+    // scrolling, so let it, and forget the whole thing.
+    if (!drag.armed) {
+      if (moved > 8) dragCancel();
+      return;
+    }
+    if (moved < DRAG_SLOP) return;
+    dragEngage();
+  }
+
+  event.preventDefault();
+  drag.ghost.style.transform = `translate(${event.clientX}px, ${event.clientY}px)`;
+  dragAutoScroll(event.clientX);
+
+  const target = dropTargetAt(event.clientX, event.clientY);
+  if (target !== drag.over) {
+    if (drag.over) drag.over.classList.remove('drop-hover');
+    if (target) target.classList.add('drop-hover');
+    drag.over = target;
+  }
+}, { passive: false });
+
+document.addEventListener('pointerup', async (event) => {
+  if (drag.id === null || event.pointerId !== drag.pointer) return;
+  const target = drag.ghost ? dropTargetAt(event.clientX, event.clientY) : null;
+  const { id, name } = drag;
+  const wasDragging = Boolean(drag.ghost);
+  dragCancel();
+  if (!wasDragging || !target) return;
+
+  // A real drop happened, so the click that would follow is not wanted.
+  event.preventDefault();
+
+  try {
+    if (target.dataset.unplace) {
+      await api(`/api/containers/${id}/position`, {
+        method: 'PUT',
+        body: JSON.stringify({ level: null, slot: null }),
+      });
+      toast(`${name} taken off the shelf`);
+    } else {
+      const level = Number(target.dataset.level);
+      const slot = Number(target.dataset.slot);
+      await api(`/api/containers/${id}/position`, {
+        method: 'PUT',
+        body: JSON.stringify({ level, slot, swap: true }),
+      });
+      toast(`${name} → L-${level}:${slot}`);
+    }
+    await reload();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+// A cell is an <a>, and a link drags natively. That native drag takes over the
+// pointer stream the moment it starts, so pointermove stops arriving and the
+// drop never registers. Refusing it here keeps the gesture ours.
+document.addEventListener('dragstart', (event) => {
+  if (event.target.closest && event.target.closest('.draggable')) event.preventDefault();
+});
+
+document.addEventListener('pointercancel', dragCancel);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && drag.id !== null) dragCancel();
+});
+
+// A drag that ends on a box must not also follow its link.
+document.addEventListener('click', (event) => {
+  if (document.body.classList.contains('dragging')) event.preventDefault();
+}, true);
 
 /** The queue of containers whose contents haven't been confirmed in a while. */
 async function viewReview() {
@@ -1442,17 +1629,6 @@ async function submitLayout(form) {
   await reload();
 }
 
-async function submitPosition(form) {
-  const [level, slot] = String(new FormData(form).get('cell')).split(':').map(Number);
-  await api(`/api/containers/${form.dataset.id}/position`, {
-    method: 'PUT',
-    body: JSON.stringify({ level, slot }),
-  });
-  closeModal();
-  toast(`Placed at L-${level}:${slot}`);
-  await reload();
-}
-
 async function submitSettings(form) {
   const fd = new FormData(form);
   const payload = {};
@@ -1538,99 +1714,6 @@ const actions = {
     });
     closeModal();
     toast('Layout removed');
-    await reload();
-  },
-
-  /** Choose a slot for a box, from the box's own page. */
-  'place-box': async (el) => {
-    const detail = await api(`/api/containers/${el.dataset.id}`);
-    const grid = detail.parent_grid;
-    if (!grid) {
-      toast('The shelf this is on has no layout yet', true);
-      return;
-    }
-    const current = detail.container.position;
-    const options = grid.cells
-      .filter((cell) => !cell.container || cell.container.id === detail.container.id)
-      .map((cell) => `<option value="${cell.level}:${cell.slot}"
-        ${current && current.level === cell.level && current.slot === cell.slot ? 'selected' : ''}>
-        ${esc(cell.label)}</option>`)
-      .join('');
-    openModal(`
-      <h2>Where on ${esc(grid.container_name)}?</h2>
-      ${shelfMap(grid, { locateId: detail.container.id, interactive: false })}
-      <form data-form="position" data-id="${el.dataset.id}">
-        <label>Slot<select name="cell">${options}</select></label>
-        <div class="modal-actions">
-          ${current
-            ? `<button type="button" class="danger" data-act="unplace-box"
-                 data-id="${el.dataset.id}">Take out of the grid</button>`
-            : ''}
-          <button type="button" data-act="close-modal">Cancel</button>
-          <button class="primary" type="submit">Put it there</button>
-        </div>
-      </form>`);
-  },
-
-  'unplace-box': async (el) => {
-    await api(`/api/containers/${el.dataset.id}/position`, {
-      method: 'PUT',
-      body: JSON.stringify({ level: null, slot: null }),
-    });
-    closeModal();
-    toast('Taken out of the grid');
-    await reload();
-  },
-
-  /** Remember which unplaced box the next empty cell should receive. */
-  'pick-unplaced': (el) => {
-    pendingPlacement = { id: Number(el.dataset.id), name: el.dataset.name };
-    document.querySelectorAll('.unplaced-strip .chip').forEach((chip) => {
-      chip.style.borderStyle = chip === el ? 'solid' : 'dashed';
-    });
-    toast(`Now click an empty slot for ${el.dataset.name}`);
-  },
-
-  /** Clicking an empty cell: place the pending box, or offer a choice. */
-  'place-here': async (el) => {
-    const level = Number(el.dataset.level);
-    const slot = Number(el.dataset.slot);
-    if (pendingPlacement) {
-      const { id, name } = pendingPlacement;
-      pendingPlacement = null;
-      await api(`/api/containers/${id}/position`, {
-        method: 'PUT',
-        body: JSON.stringify({ level, slot }),
-      });
-      toast(`${name} is now at L-${level}:${slot}`);
-      await reload();
-      return;
-    }
-    const detail = await api(`/api/containers/${el.dataset.parent}`);
-    const loose = (detail.grid && detail.grid.unplaced) || [];
-    if (!loose.length) {
-      toast('Everything on this shelf already has a slot', true);
-      return;
-    }
-    openModal(`
-      <h2>What goes in L-${level}:${slot}?</h2>
-      <div class="unplaced-strip" style="margin-top:12px">
-        ${loose.map((c) => `<button class="chip" data-act="place-now"
-             data-id="${c.id}" data-level="${level}" data-slot="${slot}"
-             data-name="${esc(c.name)}">${esc(c.code)} · ${esc(c.name)}</button>`).join('')}
-      </div>
-      <div class="modal-actions">
-        <button type="button" data-act="close-modal">Cancel</button>
-      </div>`);
-  },
-
-  'place-now': async (el) => {
-    await api(`/api/containers/${el.dataset.id}/position`, {
-      method: 'PUT',
-      body: JSON.stringify({ level: Number(el.dataset.level), slot: Number(el.dataset.slot) }),
-    });
-    closeModal();
-    toast(`${el.dataset.name} is now at L-${el.dataset.level}:${el.dataset.slot}`);
     await reload();
   },
 
@@ -1941,7 +2024,6 @@ document.addEventListener('submit', async (event) => {
     else if (kind === 'container') await submitContainer(form);
     else if (kind === 'settings') await submitSettings(form);
     else if (kind === 'layout') await submitLayout(form);
-    else if (kind === 'position') await submitPosition(form);
   } catch (err) {
     toast(err.message, true);
   } finally {
