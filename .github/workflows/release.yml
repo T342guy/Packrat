@@ -167,6 +167,7 @@ jobs:
         run: |
           ./scripts/test-next-version.sh
           ./scripts/test-bench-tools.sh
+          ./scripts/test-release-commit.sh
 
       - name: Tests
         run: cargo test --locked
@@ -366,27 +367,21 @@ jobs:
         # Deliberately here and not in `prepare`: the version is only spent,
         # and the tag only created, once the checks and every build have
         # passed. A failing run leaves no dangling tag and burns no number.
+        #
+        # The logic lives in a script rather than here because the version it
+        # replaced was shell inside this file that nothing executed until a
+        # real release ran — which is how it shipped pushing the tag without
+        # the branch. scripts/test-release-commit.sh runs it against a real
+        # git remote instead.
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
-          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
         run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          scripts/stamp-version.sh "$VERSION"
-          git add Cargo.toml Cargo.lock
-          git commit -m "Release $VERSION [skip ci]"
-          git tag -a "$TAG" -m "Packrat $VERSION"
-          if [[ "$PRERELEASE" == "true" ]]; then
-            # A pre-release must not move the branch. The stamped version is
-            # throwaway, and leaving it on main would misreport the version
-            # every later build until the next production release. Pushing the
-            # tag carries the commit along, so the release is still complete.
-            git push origin "$TAG"
-          else
-            git push origin "HEAD:$GITHUB_REF" "$TAG"
-          fi
+          scripts/release-commit.sh \
+            --version "$VERSION" --tag "$TAG" \
+            --channel "$CHANNEL" --branch "$BRANCH"
 
       - uses: actions/download-artifact@v4
         with:

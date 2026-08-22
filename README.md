@@ -468,6 +468,30 @@ every contributor channel can all be running against 0.1.4 at once and the next
 production release is still 0.1.4. Counters are per channel, so they advance
 independently and each one restarts at 1 once production ships.
 
+**Where the version bump lands** depends on whose branch it is:
+
+| Channel | The bump commit |
+| --- | --- |
+| production, `pre`, `dev` | committed onto the branch, which the tag then points at |
+| a contributor's channel | not created — the tag marks the commit that was built |
+
+`main` and `dev` are the project's own branches and their release cadence is
+the pipeline's business, so the version they report matches the release just
+cut from them: check either one out and `packrat --version` agrees with its
+newest tag. A pull request branch belongs to whoever opened it, and pushing a
+commit into it mid-review would move work under their feet, so those releases
+tag the built commit and leave the branch alone.
+
+Either way, **no tag ever points at a commit that no branch can reach.** An
+earlier version of this pushed the tag without the branch for every
+pre-release, which left `dev` frozen at the last production version while its
+tags dangled off orphan commits. `scripts/test-release-commit.sh` runs the
+real script against a real git remote and asserts the tag is an ancestor of
+the branch, which is the assertion that was missing.
+
+If the branch moves while a build is running, the bump is replayed on top of
+where it got to. Nothing is ever force-pushed.
+
 Two details that look inconsistent but aren't:
 
 - **Days are not zero-padded, and channels are lowercased.** Semver forbids
