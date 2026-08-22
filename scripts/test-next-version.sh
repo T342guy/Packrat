@@ -13,6 +13,21 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 pass=0; fail=0
 today="$(date -u +%Y).$(date -u +%b | tr '[:upper:]' '[:lower:]').$(date -u +%-d)"
 
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+
+# A few cases exercise the "nothing tagged yet" fallback, where the base comes
+# from the manifest. They get their own manifest to read, never the repo's:
+# asserting against the real Cargo.toml would mean the expected values silently
+# tracked whatever the last release stamped there, and the suite would break on
+# its own release commits. Nothing in here may depend on the version Packrat
+# happens to be at today.
+fixture() { # version -> path to a manifest carrying it
+  local dir="$tmp/manifest-$1"
+  mkdir -p "$dir"
+  printf '[package]\nname = "packrat"\nversion = "%s"\n' "$1" > "$dir/Cargo.toml"
+  printf '%s' "$dir/Cargo.toml"
+}
+
 check() { # name  expected  tags  args...
   local name="$1" expect="$2" tags="$3"; shift 3
   local got
@@ -36,8 +51,25 @@ plan() { # name  expected-substring  args...
 }
 
 echo "== no tags at all: the manifest supplies the base =="
-check "patch from empty history"   "0.1.1-$today"        ""  patch
-check "pre channel from empty"     "0.1.1-pre1-$today"   ""  patch --channel pre
+plain="$(fixture 3.7.2)"
+check "patch from empty history"   "3.7.3-$today"        "" patch --manifest "$plain"
+check "minor from empty history"   "3.8.0-$today"        "" minor --manifest "$plain"
+check "pre channel from empty"     "3.7.3-pre1-$today"   "" patch --channel pre --manifest "$plain"
+check "dev channel from empty"     "3.7.3-dev1-$today"   "" patch --channel dev --manifest "$plain"
+
+# After any release the manifest carries a full version string, so the
+# fallback has to strip the date and any channel back off before bumping.
+check "a dated manifest is read back to its number" "0.1.4-$today" \
+  "" patch --manifest "$(fixture 0.1.3-2026.aug.21)"
+check "a pre-release manifest too"                  "0.1.4-$today" \
+  "" patch --manifest "$(fixture 0.1.3-pre7-2026.aug.21)"
+check "a contributor-channel manifest too"          "0.1.4-$today" \
+  "" patch --manifest "$(fixture 0.1.3-claude.2-2026.aug.21)"
+
+# The guard on all of the above: the fixture must win over the repo's own
+# Cargo.toml, or these assertions would drift with every release.
+check "the repo's own version is never consulted" "9.9.10-$today" \
+  "" patch --manifest "$(fixture 9.9.9)"
 
 echo
 echo "== a plain production history =="
@@ -99,8 +131,8 @@ check "double-digit counters" "0.1.4-dev11-$today" \
   $'v0.1.3-2026.aug.20\nv0.1.4-dev9-2026.aug.21\nv0.1.4-dev10-2026.aug.21' patch --channel dev
 check "malformed tags ignored" "0.2.0-$today" \
   $'v0.1.9-2026.aug.19\nnightly\nv2-broken\nv0.1.999' minor
-check "a pre-release tag is never read as production" "0.1.1-$today" \
-  $'v0.1.0-pre4-2026.aug.19\nv0.1.0-dev9-2026.aug.19' patch
+check "a pre-release tag is never read as production" "5.0.1-$today" \
+  $'v0.1.0-pre4-2026.aug.19\nv0.1.0-dev9-2026.aug.19' patch --manifest "$(fixture 5.0.0)"
 check "bad argument rejected" "ERROR(2): unknown argument '--nope'" "$prod" patch --nope
 check "an uppercase channel is rejected" \
   "ERROR(2): channel 'Claude' is not a usable version identifier" "$prod" patch --channel Claude
@@ -152,7 +184,6 @@ plan "an unusable login publishes nothing" "publish=false" \
 
 echo
 echo "== every emitted version is valid semver for cargo =="
-tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/src"; echo 'fn main(){}' > "$tmp/src/main.rs"
 for v in "0.1.3-$today" "0.1.3-pre1-$today" "0.1.3-dev11-$today" \
          "0.1.3-claude.1-$today" "0.1.3-some-user.9-$today" "0.1.3-u12345.1-$today"; do
