@@ -117,6 +117,50 @@ on it with its contents folded away underneath — expand a box to see and edit
 what's in it without navigating away. Each row shows how long it's been since
 that box was last verified.
 
+### Where things physically are
+
+A shelf can be mapped out as a grid — so many levels, so many slots across —
+and each box on it gets a slot. Open the shelf and you see it drawn: every
+level, every slot, with the gaps shown as gaps.
+
+```
+        ┌───────────────┬───────────────┬───────────────┐
+   L-1  │ BX-VTMM       │       2       │       3       │
+        │ Christmas     │               │               │
+        ├───────────────┼───────────────┼───────────────┤
+   L-2  │       1       │       2       │ BX-4E3M       │
+        │               │               │ Camping gear  │
+        └───────────────┴───────────────┴───────────────┘
+```
+
+`L-2:3` is level 2 from the top, slot 3 from the left. Both count from 1.
+
+The payoff is on a box's own page: it shows you the shelf it lives on with its
+own slot lit up and the rest dimmed, so you get *where it is* at a glance
+rather than a coordinate you have to translate in your head.
+
+It is deliberately **not** a 3D model. A shelf has two axes you would actually
+type in — which level, how far along — and nothing here is drawn to scale.
+Depth, height and real measurements are exactly the data nobody keeps up to
+date, so the app never asks for them. The slight perspective on the drawing is
+cosmetic; the model underneath is a flat grid.
+
+To set one up, open a shelf and choose **Map this out as a shelf**. Then either
+pick an unplaced box and click a slot, or click an empty slot and choose what
+goes in it. From a box, **Move it** offers every free slot on its shelf.
+
+A few rules the app enforces so the map cannot quietly go wrong:
+
+- One slot holds one thing. The database has a unique index on it, so this
+  holds even if two people place boxes at the same moment.
+- Slots belong to a shelf, not to a box. Move a box elsewhere, or delete the
+  shelf it was on, and it gives its slot up rather than carrying `L-2:3` into
+  a grid where that means something else.
+- A layout will not shrink out from under something already placed. It tells
+  you how many boxes are in the way instead of silently losing where they are.
+- Removing a layout leaves every box exactly where it is; they just stop
+  having numbered slots.
+
 ### The scan-a-box workflow
 
 1. Pack a box, add its items in the app.

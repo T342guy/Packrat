@@ -48,6 +48,18 @@ fn kind_prefix(kind: &str) -> &'static str {
 /// and boxes inside it, not scattered directly in the room.
 pub const CONTAINER_ONLY_KINDS: &[&str] = &["area"];
 
+/// Bounds on a grid. Generous for a garage — a shelving unit with more than
+/// twelve levels or twenty-four slots across is not a thing anyone is
+/// labelling by hand — while stopping a typo turning into a 10,000-cell page.
+pub const MAX_GRID_LEVELS: i64 = 12;
+pub const MAX_GRID_SLOTS: i64 = 24;
+
+/// "L-2:3" — level 2, slot 3. Levels count from the top and slots from the
+/// left, both starting at 1, which is the order you read a shelf in.
+pub fn position_label(level: i64, slot: i64) -> String {
+    format!("L-{level}:{slot}")
+}
+
 pub fn holds_items(kind: &str) -> bool {
     !CONTAINER_ONLY_KINDS.contains(&kind)
 }
@@ -228,6 +240,10 @@ struct RawContainer {
     updated_at: String,
     checked_at: Option<String>,
     age_seconds: i64,
+    grid_levels: Option<i64>,
+    grid_slots: Option<i64>,
+    pos_level: Option<i64>,
+    pos_slot: Option<i64>,
 }
 
 fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
@@ -236,7 +252,8 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
         "SELECT id, code, name, kind, parent_id, notes, photo_id, barcode, created_at, updated_at,
                 checked_at,
                 CAST((julianday(?1) - julianday(COALESCE(checked_at, created_at))) * 86400
-                     AS INTEGER)
+                     AS INTEGER),
+                grid_levels, grid_slots, pos_level, pos_slot
          FROM containers",
     )?;
     let rows = stmt.query_map([&now], |r| {
@@ -253,6 +270,10 @@ fn load_raw(conn: &Connection) -> AppResult<Vec<RawContainer>> {
             updated_at: r.get(9)?,
             checked_at: r.get(10)?,
             age_seconds: r.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0),
+            grid_levels: r.get(12)?,
+            grid_slots: r.get(13)?,
+            pos_level: r.get(14)?,
+            pos_slot: r.get(15)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -367,6 +388,20 @@ pub fn all_containers(conn: &Connection) -> AppResult<Vec<Container>> {
                 item_count,
                 total_quantity,
                 child_count: child_counts.get(&c.id).copied().unwrap_or(0),
+                grid: match (c.grid_levels, c.grid_slots) {
+                    (Some(levels), Some(slots)) if levels > 0 && slots > 0 => {
+                        Some(Grid { levels, slots })
+                    }
+                    _ => None,
+                },
+                position: match (c.pos_level, c.pos_slot) {
+                    (Some(level), Some(slot)) => Some(Position {
+                        level,
+                        slot,
+                        label: position_label(level, slot),
+                    }),
+                    _ => None,
+                },
             }
         })
         .collect();
@@ -527,6 +562,17 @@ pub fn update_container(
             id
         ],
     )?;
+    // Same reasoning as deletion: a slot is a slot on one particular shelf.
+    let moved = all
+        .iter()
+        .find(|c| c.id == id)
+        .is_some_and(|c| c.parent_id != input.parent_id);
+    if moved {
+        conn.execute(
+            "UPDATE containers SET pos_level = NULL, pos_slot = NULL WHERE id = ?1",
+            [id],
+        )?;
+    }
     container_by_id(conn, id)
 }
 
@@ -542,8 +588,12 @@ pub fn delete_container(conn: &mut Connection, id: i64) -> AppResult<()> {
         )
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("no container with id {id}")))?;
+    // Their slot belonged to the container being deleted, so it goes with it.
+    // Carrying the coordinates up would put them in a different shelf's grid,
+    // where they mean nothing and can collide with what is already there.
     tx.execute(
-        "UPDATE containers SET parent_id = ?1 WHERE parent_id = ?2",
+        "UPDATE containers SET parent_id = ?1, pos_level = NULL, pos_slot = NULL
+          WHERE parent_id = ?2",
         params![parent, id],
     )?;
     tx.execute(
@@ -566,6 +616,164 @@ pub fn mark_checked(conn: &Connection, id: i64) -> AppResult<Container> {
         return Err(AppError::not_found(format!("no container with id {id}")));
     }
     container_by_id(conn, id)
+}
+
+/// Gives a container a layout, or removes it when both fields are absent.
+pub fn set_grid(conn: &Connection, id: i64, input: &GridInput) -> AppResult<Container> {
+    container_by_id(conn, id)?;
+    match (input.levels, input.slots) {
+        (None, None) => {
+            // Removing the layout strands whatever was placed in it, so those
+            // boxes simply stop having a slot. They stay on the shelf.
+            conn.execute(
+                "UPDATE containers SET pos_level = NULL, pos_slot = NULL WHERE parent_id = ?1",
+                [id],
+            )?;
+            conn.execute(
+                "UPDATE containers
+                    SET grid_levels = NULL, grid_slots = NULL, updated_at = datetime('now')
+                  WHERE id = ?1",
+                [id],
+            )?;
+        }
+        (Some(levels), Some(slots)) => {
+            if !(1..=MAX_GRID_LEVELS).contains(&levels) {
+                return Err(AppError::bad_request(format!(
+                    "levels must be between 1 and {MAX_GRID_LEVELS}"
+                )));
+            }
+            if !(1..=MAX_GRID_SLOTS).contains(&slots) {
+                return Err(AppError::bad_request(format!(
+                    "slots must be between 1 and {MAX_GRID_SLOTS}"
+                )));
+            }
+            // Shrinking under something already placed would silently lose
+            // where it is, which is the one thing this feature exists to know.
+            let stranded: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM containers
+                  WHERE parent_id = ?1 AND pos_level IS NOT NULL
+                    AND (pos_level > ?2 OR pos_slot > ?3)",
+                params![id, levels, slots],
+                |r| r.get(0),
+            )?;
+            if stranded > 0 {
+                return Err(AppError::bad_request(format!(
+                    "{stranded} thing(s) are placed outside a {levels} x {slots} layout. \
+                     Move them first, then resize."
+                )));
+            }
+            conn.execute(
+                "UPDATE containers
+                    SET grid_levels = ?2, grid_slots = ?3, updated_at = datetime('now')
+                  WHERE id = ?1",
+                params![id, levels, slots],
+            )?;
+        }
+        _ => {
+            return Err(AppError::bad_request(
+                "levels and slots go together — give both, or neither to remove the layout",
+            ));
+        }
+    }
+    container_by_id(conn, id)
+}
+
+/// Puts a container in one of its parent's slots, or takes it out of the grid.
+pub fn set_position(conn: &Connection, id: i64, input: &PositionInput) -> AppResult<Container> {
+    let me = container_by_id(conn, id)?;
+    match (input.level, input.slot) {
+        (None, None) => {
+            conn.execute(
+                "UPDATE containers
+                    SET pos_level = NULL, pos_slot = NULL, updated_at = datetime('now')
+                  WHERE id = ?1",
+                [id],
+            )?;
+        }
+        (Some(level), Some(slot)) => {
+            let parent_id = me.parent_id.ok_or_else(|| {
+                AppError::bad_request("this is not inside anything, so it has no slot to sit in")
+            })?;
+            let parent = container_by_id(conn, parent_id)?;
+            let grid = parent.grid.ok_or_else(|| {
+                AppError::bad_request(format!(
+                    "{} has no layout yet — set its levels and slots up first",
+                    parent.name
+                ))
+            })?;
+            if !(1..=grid.levels).contains(&level) || !(1..=grid.slots).contains(&slot) {
+                return Err(AppError::bad_request(format!(
+                    "{} is outside {} — it has {} level(s) and {} slot(s)",
+                    position_label(level, slot),
+                    parent.name,
+                    grid.levels,
+                    grid.slots
+                )));
+            }
+            let taken: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM containers
+                      WHERE parent_id = ?1 AND pos_level = ?2 AND pos_slot = ?3 AND id <> ?4",
+                    params![parent_id, level, slot, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(name) = taken {
+                return Err(AppError::bad_request(format!(
+                    "{} is already taken by {name}",
+                    position_label(level, slot)
+                )));
+            }
+            conn.execute(
+                "UPDATE containers
+                    SET pos_level = ?2, pos_slot = ?3, updated_at = datetime('now')
+                  WHERE id = ?1",
+                params![id, level, slot],
+            )?;
+        }
+        _ => {
+            return Err(AppError::bad_request(
+                "level and slot go together — give both, or neither to remove the placement",
+            ));
+        }
+    }
+    container_by_id(conn, id)
+}
+
+/// Assembles a container's grid with whatever is sitting in it. Every cell is
+/// present, empty ones included, so the front end draws the shelf rather than
+/// working out the gaps itself.
+fn grid_view(all: &[Container], id: i64) -> Option<GridView> {
+    let container = all.iter().find(|c| c.id == id)?;
+    let grid = container.grid?;
+    let children: Vec<&Container> = all.iter().filter(|c| c.parent_id == Some(id)).collect();
+
+    let mut cells = Vec::with_capacity((grid.levels * grid.slots) as usize);
+    for level in 1..=grid.levels {
+        for slot in 1..=grid.slots {
+            let occupant = children
+                .iter()
+                .find(|c| matches!(&c.position, Some(p) if p.level == level && p.slot == slot));
+            cells.push(GridCell {
+                level,
+                slot,
+                label: position_label(level, slot),
+                container: occupant.map(|c| (*c).clone()),
+            });
+        }
+    }
+    Some(GridView {
+        container_id: id,
+        container_name: container.name.clone(),
+        levels: grid.levels,
+        slots: grid.slots,
+        cells,
+        unplaced: children
+            .iter()
+            .filter(|c| c.position.is_none())
+            .map(|c| (*c).clone())
+            .collect(),
+    })
 }
 
 pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail> {
@@ -631,6 +839,11 @@ pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail
         .filter(|c| nested.contains(&c.id))
         .fold((0, 0), |(n, q), c| (n + c.item_count, q + c.total_quantity));
 
+    let grid = grid_view(&all, id);
+    // Sent alongside so a box can draw the shelf it is on, with itself lit up,
+    // without a second round trip.
+    let parent_grid = container.parent_id.and_then(|pid| grid_view(&all, pid));
+
     Ok(ContainerDetail {
         container,
         ancestors,
@@ -638,6 +851,8 @@ pub fn container_detail(conn: &Connection, id: i64) -> AppResult<ContainerDetail
         items,
         nested_item_count,
         nested_total_quantity,
+        grid,
+        parent_grid,
     })
 }
 
@@ -1846,6 +2061,19 @@ mod tests {
             [garage.id, tent.id],
         )
         .unwrap();
+        // Wind the schema back too, not just the counter. A migration is
+        // entitled to assume it runs once, so replaying one over a database
+        // that already has its columns is not a case worth supporting — but
+        // pretending to be an old database while keeping the new columns is
+        // exactly how you end up testing something that cannot happen.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_containers_position;
+             ALTER TABLE containers DROP COLUMN grid_levels;
+             ALTER TABLE containers DROP COLUMN grid_slots;
+             ALTER TABLE containers DROP COLUMN pos_level;
+             ALTER TABLE containers DROP COLUMN pos_slot;",
+        )
+        .unwrap();
         conn.pragma_update(None, "user_version", 3).unwrap();
 
         crate::db::migrate(&mut conn).unwrap();
@@ -1853,6 +2081,285 @@ mod tests {
         let after = item_by_id(&conn, tent.id).unwrap();
         assert_eq!(after.container_id, None, "kept, but unfiled");
         assert_eq!(after.name, "Tent");
+    }
+
+    // ------------------------------------------------------------- layout
+
+    fn grid(conn: &Connection, id: i64, levels: i64, slots: i64) -> AppResult<Container> {
+        set_grid(
+            conn,
+            id,
+            &GridInput {
+                levels: Some(levels),
+                slots: Some(slots),
+            },
+        )
+    }
+
+    fn place(conn: &Connection, id: i64, level: i64, slot: i64) -> AppResult<Container> {
+        set_position(
+            conn,
+            id,
+            &PositionInput {
+                level: Some(level),
+                slot: Some(slot),
+            },
+        )
+    }
+
+    #[test]
+    fn a_shelf_can_be_given_a_layout_and_a_box_a_slot() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+
+        assert!(grid(&conn, shelf.id, 3, 4).unwrap().grid.is_some());
+        let placed = place(&conn, bx.id, 1, 1).unwrap();
+        let pos = placed.position.expect("placed");
+        assert_eq!((pos.level, pos.slot), (1, 1));
+        assert_eq!(pos.label, "L-1:1", "the form you would write on a label");
+    }
+
+    #[test]
+    fn a_slot_holds_one_thing() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let first = container(&conn, "Camping", "box", Some(shelf.id));
+        let second = container(&conn, "Tools", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&conn, first.id, 1, 1).unwrap();
+
+        let clash = place(&conn, second.id, 1, 1).unwrap_err().to_string();
+        assert!(clash.contains("already taken"), "{clash}");
+        assert!(
+            clash.contains("Camping"),
+            "says what is in the way: {clash}"
+        );
+    }
+
+    #[test]
+    fn a_slot_has_to_exist() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 3).unwrap();
+
+        for (level, slot) in [(3, 1), (1, 4), (0, 1), (1, 0)] {
+            let err = place(&conn, bx.id, level, slot).unwrap_err().to_string();
+            assert!(err.contains("outside"), "L-{level}:{slot} -> {err}");
+        }
+    }
+
+    #[test]
+    fn a_slot_needs_a_shelf_with_a_layout() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        let err = place(&conn, bx.id, 1, 1).unwrap_err().to_string();
+        assert!(err.contains("no layout yet"), "{err}");
+
+        let loose = container(&conn, "Stray", "box", None);
+        let err = place(&conn, loose.id, 1, 1).unwrap_err().to_string();
+        assert!(err.contains("not inside anything"), "{err}");
+    }
+
+    #[test]
+    fn a_layout_cannot_shrink_under_something() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 3, 4).unwrap();
+        place(&conn, bx.id, 3, 4).unwrap();
+
+        let err = grid(&conn, shelf.id, 2, 2).unwrap_err().to_string();
+        assert!(err.contains("placed outside"), "{err}");
+        // Growing is always fine, and shrinking works once it is out of range.
+        grid(&conn, shelf.id, 6, 8).unwrap();
+        place(&conn, bx.id, 1, 1).unwrap();
+        assert!(grid(&conn, shelf.id, 2, 2).is_ok());
+    }
+
+    #[test]
+    fn removing_a_layout_strands_nothing() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&conn, bx.id, 2, 2).unwrap();
+
+        set_grid(
+            &conn,
+            shelf.id,
+            &GridInput {
+                levels: None,
+                slots: None,
+            },
+        )
+        .unwrap();
+        let after = container_by_id(&conn, bx.id).unwrap();
+        assert!(after.grid.is_none() || after.position.is_none());
+        assert_eq!(after.position, None, "the slot went with the layout");
+        assert_eq!(after.parent_id, Some(shelf.id), "but the box stayed put");
+    }
+
+    #[test]
+    fn moving_a_box_gives_up_its_slot() {
+        let conn = test_db();
+        let first = container(&conn, "North wall", "shelf", None);
+        let second = container(&conn, "South wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(first.id));
+        grid(&conn, first.id, 2, 2).unwrap();
+        place(&conn, bx.id, 2, 2).unwrap();
+
+        update_container(
+            &conn,
+            bx.id,
+            &ContainerInput {
+                name: "Camping".into(),
+                kind: "box".into(),
+                parent_id: Some(second.id),
+                notes: String::new(),
+                photo_id: None,
+                code: None,
+                barcode: None,
+            },
+        )
+        .unwrap();
+
+        let after = container_by_id(&conn, bx.id).unwrap();
+        assert_eq!(after.parent_id, Some(second.id));
+        assert_eq!(
+            after.position, None,
+            "L-2:2 was a slot on the other shelf, not a property of the box"
+        );
+    }
+
+    #[test]
+    fn deleting_a_shelf_does_not_carry_slots_upwards() {
+        let mut conn = test_db();
+        let area = container(&conn, "Garage", "area", None);
+        let shelf = container(&conn, "North wall", "shelf", Some(area.id));
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+        place(&conn, bx.id, 1, 2).unwrap();
+
+        // Without clearing the slot this trips the unique index, or worse,
+        // silently claims L-1:2 of whatever the box lands in.
+        delete_container(&mut conn, shelf.id).unwrap();
+        let after = container_by_id(&conn, bx.id).unwrap();
+        assert_eq!(after.parent_id, Some(area.id), "lifted, not deleted");
+        assert_eq!(after.position, None);
+    }
+
+    #[test]
+    fn two_shelves_can_use_the_same_coordinates() {
+        let conn = test_db();
+        let first = container(&conn, "North wall", "shelf", None);
+        let second = container(&conn, "South wall", "shelf", None);
+        let a = container(&conn, "Camping", "box", Some(first.id));
+        let b = container(&conn, "Tools", "box", Some(second.id));
+        grid(&conn, first.id, 2, 2).unwrap();
+        grid(&conn, second.id, 2, 2).unwrap();
+
+        place(&conn, a.id, 1, 1).unwrap();
+        place(&conn, b.id, 1, 1).expect("L-1:1 is per shelf, not global");
+    }
+
+    #[test]
+    fn a_grid_renders_every_cell_including_the_empty_ones() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        let spare = container(&conn, "Unplaced", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 3).unwrap();
+        place(&conn, bx.id, 2, 3).unwrap();
+
+        let detail = container_detail(&conn, shelf.id).unwrap();
+        let view = detail.grid.expect("the shelf draws itself");
+        assert_eq!(view.cells.len(), 6, "2 levels x 3 slots, gaps included");
+        assert_eq!(view.cells[0].label, "L-1:1");
+        assert!(view.cells[0].container.is_none());
+        let last = view.cells.last().unwrap();
+        assert_eq!(last.label, "L-2:3");
+        assert_eq!(last.container.as_ref().unwrap().id, bx.id);
+        assert_eq!(view.unplaced.len(), 1);
+        assert_eq!(view.unplaced[0].id, spare.id);
+    }
+
+    #[test]
+    fn a_box_is_told_where_it_sits_on_its_shelf() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 3, 3).unwrap();
+        place(&conn, bx.id, 2, 1).unwrap();
+
+        // The box's own page needs the shelf drawn, with itself lit up, and
+        // should not have to fetch the shelf separately to do it.
+        let detail = container_detail(&conn, bx.id).unwrap();
+        let shelf_view = detail.parent_grid.expect("the shelf it is on");
+        assert_eq!(shelf_view.container_id, shelf.id);
+        assert_eq!(shelf_view.container_name, "North wall");
+        let lit = shelf_view
+            .cells
+            .iter()
+            .find(|c| c.container.as_ref().is_some_and(|x| x.id == bx.id))
+            .expect("found itself in the grid");
+        assert_eq!(lit.label, "L-2:1");
+        assert!(
+            detail.grid.is_none(),
+            "a plain box has no layout of its own"
+        );
+    }
+
+    #[test]
+    fn a_layout_has_to_be_a_sensible_size() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        for (levels, slots) in [
+            (0, 4),
+            (4, 0),
+            (MAX_GRID_LEVELS + 1, 4),
+            (4, MAX_GRID_SLOTS + 1),
+        ] {
+            assert!(
+                grid(&conn, shelf.id, levels, slots).is_err(),
+                "{levels}x{slots}"
+            );
+        }
+        assert!(grid(&conn, shelf.id, MAX_GRID_LEVELS, MAX_GRID_SLOTS).is_ok());
+    }
+
+    #[test]
+    fn half_a_coordinate_is_refused() {
+        let conn = test_db();
+        let shelf = container(&conn, "North wall", "shelf", None);
+        let bx = container(&conn, "Camping", "box", Some(shelf.id));
+        grid(&conn, shelf.id, 2, 2).unwrap();
+
+        let err = set_position(
+            &conn,
+            bx.id,
+            &PositionInput {
+                level: Some(1),
+                slot: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("go together"), "{err}");
+
+        let err = set_grid(
+            &conn,
+            shelf.id,
+            &GridInput {
+                levels: Some(2),
+                slots: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("go together"), "{err}");
     }
 
     #[test]

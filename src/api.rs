@@ -111,6 +111,28 @@ pub async fn verify_container(
         .map(Json)
 }
 
+/// Sets or clears a container's grid layout — a shelf's levels and slots.
+pub async fn set_container_grid(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<GridInput>,
+) -> AppResult<Json<Container>> {
+    db::run(&st.pool, move |c| store::set_grid(c, id, &input))
+        .await
+        .map(Json)
+}
+
+/// Places a container in one of its parent's slots, or takes it out.
+pub async fn set_container_position(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<PositionInput>,
+) -> AppResult<Json<Container>> {
+    db::run(&st.pool, move |c| store::set_position(c, id, &input))
+        .await
+        .map(Json)
+}
+
 /// Containers holding items that haven't been verified within the staleness
 /// window, most overdue first.
 pub async fn stale_containers(State(st): State<AppState>) -> AppResult<Json<Value>> {

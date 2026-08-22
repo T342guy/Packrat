@@ -332,6 +332,44 @@ async function viewBox(key) {
     ? ` · ${detail.nested_item_count} including everything nested inside`
     : '';
 
+  // Where this thing physically is, drawn as the shelf it sits on with its
+  // own slot lit up. This is the whole point of the feature: you should not
+  // have to read a coordinate and translate it in your head.
+  const whereCard = detail.parent_grid && c.position
+    ? `<h2>Where it is</h2>
+       <div class="shelf-legend">
+         <span class="coord">${esc(c.position.label)}</span>
+         on ${esc(detail.parent_grid.container_name)} —
+         level ${c.position.level} from the top, slot ${c.position.slot} from the left.
+         <button class="tiny" data-act="place-box" data-id="${c.id}">Move it</button>
+       </div>
+       ${shelfMap(detail.parent_grid, { locateId: c.id, interactive: false })}`
+    : detail.parent_grid
+      ? `<h2>Where it is</h2>
+         <div class="shelf-legend">
+           Not placed on ${esc(detail.parent_grid.container_name)} yet.
+           <button class="tiny primary" data-act="place-box" data-id="${c.id}">Put it in a slot</button>
+         </div>`
+      : '';
+
+  // The container's own layout, if it has one.
+  const layoutSection = detail.grid
+    ? `<h2>Layout</h2>
+       <div class="shelf-legend">
+         ${detail.grid.levels} level${detail.grid.levels === 1 ? '' : 's'} ×
+         ${detail.grid.slots} slot${detail.grid.slots === 1 ? '' : 's'} ·
+         level 1 is the top, slot 1 is the far left
+         <button class="tiny" data-act="edit-layout" data-id="${c.id}">Resize</button>
+       </div>
+       ${unplacedStrip(detail.grid)}
+       ${shelfMap(detail.grid)}`
+    : detail.children.length
+      ? `<div class="shelf-legend" style="margin-top:-4px">
+           <button class="tiny" data-act="edit-layout" data-id="${c.id}">Map this out as a shelf</button>
+           — then you can see at a glance where everything sits.
+         </div>`
+      : '';
+
   view().innerHTML = `
     <div class="crumbs"><a href="#/boxes">All containers</a> / ${crumbs}</div>
     <div class="card" style="margin-bottom:16px">
@@ -342,7 +380,8 @@ async function viewBox(key) {
           <h1>${esc(c.name)}</h1>
           <p class="sub" style="margin:0">
             ${esc(KIND_LABEL[c.kind] || 'Container')} ·
-            ${plural(c.item_count, 'item', 'items')}${nested}
+            ${plural(c.item_count, 'item', 'items')}${nested}${
+              c.position ? ` · <span class="coord">${esc(c.position.label)}</span>` : ''}
           </p>
           ${c.notes ? `<div class="notes">${esc(c.notes)}</div>` : ''}
           <div class="checkline-status ${c.stale ? 'stale' : ''}">
@@ -366,6 +405,10 @@ async function viewBox(key) {
       </div>
     </div>
 
+    ${whereCard}
+
+    ${layoutSection}
+
     ${detail.children.length
       ? `<h2>Inside this ${esc((KIND_LABEL[c.kind] || 'container').toLowerCase())}</h2>
          ${detail.children.map(childBox).join('')}`
@@ -385,6 +428,65 @@ async function viewBox(key) {
               data-container="${c.id}">Add the first item</button></div>`, { hideLocation: true })}`
       : ''}`;
 }
+
+
+/**
+ * Draws a container's grid: levels down the page, slots across.
+ *
+ * `locateId` lights one cell up and dims the rest — that is what a box's own
+ * page uses to answer "where is this?". The perspective is CSS; the data
+ * underneath is a flat grid, because levels and slots are all anyone wants to
+ * type in and nothing here is drawn to scale.
+ */
+function shelfMap(grid, options = {}) {
+  const { locateId = null, interactive = true } = options;
+  const levels = [];
+  for (let level = 1; level <= grid.levels; level++) {
+    const cells = grid.cells
+      .filter((cell) => cell.level === level)
+      .map((cell) => {
+        const box = cell.container;
+        if (!box) {
+          return interactive
+            ? `<div class="cell empty" data-act="place-here" data-parent="${grid.container_id}"
+                    data-level="${cell.level}" data-slot="${cell.slot}"
+                    title="Put something in ${esc(cell.label)}">${cell.slot}</div>`
+            : `<div class="cell empty">${cell.slot}</div>`;
+        }
+        const located = locateId && box.id === locateId;
+        return `<a class="cell filled${located ? ' located' : ''}${box.stale ? ' is-stale' : ''}"
+                   href="#/box/${encodeURIComponent(box.code)}"
+                   title="${esc(cell.label)} — ${esc(box.name)}">
+                  <span class="cell-code">${esc(box.code)}</span>
+                  <span class="cell-name">${esc(box.name)}</span>
+                  ${box.item_count ? `<span class="cell-count">${plural(box.item_count, 'item', 'items')}</span>` : ''}
+                </a>`;
+      })
+      .join('');
+    levels.push(`<div class="shelf-level">
+        <div class="level-tag">L-${level}</div>
+        <div class="shelf-cells" style="--slots:${grid.slots}">${cells}</div>
+      </div>`);
+  }
+  return `<div class="shelf-wrap">
+      <div class="shelf${locateId ? ' locating' : ''}">${levels.join('')}</div>
+    </div>`;
+}
+
+/** The chips for children that are on the shelf but not in a numbered slot. */
+function unplacedStrip(grid) {
+  if (!grid.unplaced.length) return '';
+  return `<div class="shelf-legend">Not placed yet — pick one, then choose a slot:</div>
+    <div class="unplaced-strip">
+      ${grid.unplaced
+        .map((c) => `<button class="chip" data-act="pick-unplaced" data-id="${c.id}"
+                       data-name="${esc(c.name)}">${esc(c.code)} · ${esc(c.name)}</button>`)
+        .join('')}
+    </div>`;
+}
+
+/** The box currently waiting to be dropped into a slot, if any. */
+let pendingPlacement = null;
 
 /** The queue of containers whose contents haven't been confirmed in a while. */
 async function viewReview() {
@@ -1326,6 +1428,31 @@ async function submitContainer(form) {
   }
 }
 
+async function submitLayout(form) {
+  const fd = new FormData(form);
+  await api(`/api/containers/${form.dataset.id}/grid`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      levels: Number(fd.get('levels')),
+      slots: Number(fd.get('slots')),
+    }),
+  });
+  closeModal();
+  toast('Layout saved');
+  await reload();
+}
+
+async function submitPosition(form) {
+  const [level, slot] = String(new FormData(form).get('cell')).split(':').map(Number);
+  await api(`/api/containers/${form.dataset.id}/position`, {
+    method: 'PUT',
+    body: JSON.stringify({ level, slot }),
+  });
+  closeModal();
+  toast(`Placed at L-${level}:${slot}`);
+  await reload();
+}
+
 async function submitSettings(form) {
   const fd = new FormData(form);
   const payload = {};
@@ -1373,6 +1500,138 @@ const actions = {
     const cell = document.querySelector(`[data-qty="${item.id}"]`);
     if (cell) cell.textContent = item.quantity;
     state.stats.total_quantity += Number(el.dataset.delta);
+  },
+
+  /** Set or resize a container's grid, or take the layout away. */
+  'edit-layout': (el) => {
+    const container = containerById(el.dataset.id);
+    const grid = container && container.grid;
+    openModal(`
+      <h2>${grid ? 'Resize' : 'Map out'} ${esc(container ? container.name : 'this shelf')}</h2>
+      <p class="sub">How many levels does it have, and how many things fit side by side
+        on each one? Level 1 is the top, slot 1 is the far left. Nothing is to scale —
+        this is only so you can find things.</p>
+      <form data-form="layout" data-id="${el.dataset.id}">
+        <div class="row">
+          <label>Levels<input name="levels" type="number" min="1" max="12"
+            value="${grid ? grid.levels : 4}" required></label>
+          <label>Slots per level<input name="slots" type="number" min="1" max="24"
+            value="${grid ? grid.slots : 4}" required></label>
+        </div>
+        <div class="modal-actions">
+          ${grid
+            ? `<button type="button" class="danger" data-act="clear-layout"
+                 data-id="${el.dataset.id}">Remove layout</button>`
+            : ''}
+          <button type="button" data-act="close-modal">Cancel</button>
+          <button class="primary" type="submit">Save layout</button>
+        </div>
+      </form>`);
+  },
+
+  'clear-layout': async (el) => {
+    if (!confirm('Remove the layout? Everything stays on the shelf, it just stops '
+      + 'having a numbered slot.')) return;
+    await api(`/api/containers/${el.dataset.id}/grid`, {
+      method: 'PUT',
+      body: JSON.stringify({ levels: null, slots: null }),
+    });
+    closeModal();
+    toast('Layout removed');
+    await reload();
+  },
+
+  /** Choose a slot for a box, from the box's own page. */
+  'place-box': async (el) => {
+    const detail = await api(`/api/containers/${el.dataset.id}`);
+    const grid = detail.parent_grid;
+    if (!grid) {
+      toast('The shelf this is on has no layout yet', true);
+      return;
+    }
+    const current = detail.container.position;
+    const options = grid.cells
+      .filter((cell) => !cell.container || cell.container.id === detail.container.id)
+      .map((cell) => `<option value="${cell.level}:${cell.slot}"
+        ${current && current.level === cell.level && current.slot === cell.slot ? 'selected' : ''}>
+        ${esc(cell.label)}</option>`)
+      .join('');
+    openModal(`
+      <h2>Where on ${esc(grid.container_name)}?</h2>
+      ${shelfMap(grid, { locateId: detail.container.id, interactive: false })}
+      <form data-form="position" data-id="${el.dataset.id}">
+        <label>Slot<select name="cell">${options}</select></label>
+        <div class="modal-actions">
+          ${current
+            ? `<button type="button" class="danger" data-act="unplace-box"
+                 data-id="${el.dataset.id}">Take out of the grid</button>`
+            : ''}
+          <button type="button" data-act="close-modal">Cancel</button>
+          <button class="primary" type="submit">Put it there</button>
+        </div>
+      </form>`);
+  },
+
+  'unplace-box': async (el) => {
+    await api(`/api/containers/${el.dataset.id}/position`, {
+      method: 'PUT',
+      body: JSON.stringify({ level: null, slot: null }),
+    });
+    closeModal();
+    toast('Taken out of the grid');
+    await reload();
+  },
+
+  /** Remember which unplaced box the next empty cell should receive. */
+  'pick-unplaced': (el) => {
+    pendingPlacement = { id: Number(el.dataset.id), name: el.dataset.name };
+    document.querySelectorAll('.unplaced-strip .chip').forEach((chip) => {
+      chip.style.borderStyle = chip === el ? 'solid' : 'dashed';
+    });
+    toast(`Now click an empty slot for ${el.dataset.name}`);
+  },
+
+  /** Clicking an empty cell: place the pending box, or offer a choice. */
+  'place-here': async (el) => {
+    const level = Number(el.dataset.level);
+    const slot = Number(el.dataset.slot);
+    if (pendingPlacement) {
+      const { id, name } = pendingPlacement;
+      pendingPlacement = null;
+      await api(`/api/containers/${id}/position`, {
+        method: 'PUT',
+        body: JSON.stringify({ level, slot }),
+      });
+      toast(`${name} is now at L-${level}:${slot}`);
+      await reload();
+      return;
+    }
+    const detail = await api(`/api/containers/${el.dataset.parent}`);
+    const loose = (detail.grid && detail.grid.unplaced) || [];
+    if (!loose.length) {
+      toast('Everything on this shelf already has a slot', true);
+      return;
+    }
+    openModal(`
+      <h2>What goes in L-${level}:${slot}?</h2>
+      <div class="unplaced-strip" style="margin-top:12px">
+        ${loose.map((c) => `<button class="chip" data-act="place-now"
+             data-id="${c.id}" data-level="${level}" data-slot="${slot}"
+             data-name="${esc(c.name)}">${esc(c.code)} · ${esc(c.name)}</button>`).join('')}
+      </div>
+      <div class="modal-actions">
+        <button type="button" data-act="close-modal">Cancel</button>
+      </div>`);
+  },
+
+  'place-now': async (el) => {
+    await api(`/api/containers/${el.dataset.id}/position`, {
+      method: 'PUT',
+      body: JSON.stringify({ level: Number(el.dataset.level), slot: Number(el.dataset.slot) }),
+    });
+    closeModal();
+    toast(`${el.dataset.name} is now at L-${el.dataset.level}:${el.dataset.slot}`);
+    await reload();
   },
 
   'add-box': (el) => containerModal(null, { parent_id: el.dataset.parent || currentContainerId() }),
@@ -1681,6 +1940,8 @@ document.addEventListener('submit', async (event) => {
     if (kind === 'item') await submitItem(form);
     else if (kind === 'container') await submitContainer(form);
     else if (kind === 'settings') await submitSettings(form);
+    else if (kind === 'layout') await submitLayout(form);
+    else if (kind === 'position') await submitPosition(form);
   } catch (err) {
     toast(err.message, true);
   } finally {

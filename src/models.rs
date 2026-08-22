@@ -33,6 +33,47 @@ pub struct Container {
     pub item_count: i64,
     pub total_quantity: i64,
     pub child_count: i64,
+    /// This container is laid out as a grid — a shelf with levels and slots.
+    pub grid: Option<Grid>,
+    /// Where this container sits in its parent's grid, if the parent has one.
+    pub position: Option<Position>,
+}
+
+/// A container's own layout. Levels are counted from the top, slots from the
+/// left, both starting at 1 — the order you read a shelf in.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct Grid {
+    pub levels: i64,
+    pub slots: i64,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct Position {
+    pub level: i64,
+    pub slot: i64,
+    /// "L-2:3", the form you would write on a label.
+    pub label: String,
+}
+
+/// One cell of a rendered grid, occupied or not.
+#[derive(Debug, Serialize, Clone)]
+pub struct GridCell {
+    pub level: i64,
+    pub slot: i64,
+    pub label: String,
+    pub container: Option<Container>,
+}
+
+/// A grid with everything sitting in it, ready to draw.
+#[derive(Debug, Serialize, Clone)]
+pub struct GridView {
+    pub container_id: i64,
+    pub container_name: String,
+    pub levels: i64,
+    pub slots: i64,
+    pub cells: Vec<GridCell>,
+    /// Children of this container that have no slot yet.
+    pub unplaced: Vec<Container>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -156,4 +197,27 @@ pub struct ContainerDetail {
     /// Everything inside this container *and* its descendants.
     pub nested_item_count: i64,
     pub nested_total_quantity: i64,
+    /// This container's own layout, with whatever is sitting in it.
+    pub grid: Option<GridView>,
+    /// The parent's layout, so a box can show you where on the shelf it is
+    /// without a second request.
+    pub parent_grid: Option<GridView>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GridInput {
+    /// Both `None` removes the layout.
+    #[serde(default)]
+    pub levels: Option<i64>,
+    #[serde(default)]
+    pub slots: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PositionInput {
+    /// Both `None` takes the container out of its parent's grid.
+    #[serde(default)]
+    pub level: Option<i64>,
+    #[serde(default)]
+    pub slot: Option<i64>,
 }

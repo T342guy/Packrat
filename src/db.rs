@@ -142,6 +142,29 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 4)?;
         tx.commit()?;
     }
+
+    if version < 5 {
+        // Where things physically are. A container can *have* a grid (a shelf
+        // with levels and slots) and can *sit in* its parent's grid. Two axes
+        // is all a shelf has: depth is not something anyone wants to type in,
+        // and nothing here is drawn to scale.
+        //
+        // The partial unique index is the real guard against two boxes
+        // claiming one slot. Checking that in Rust alone would leave the
+        // window between the check and the write open.
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE containers ADD COLUMN grid_levels INTEGER;
+             ALTER TABLE containers ADD COLUMN grid_slots INTEGER;
+             ALTER TABLE containers ADD COLUMN pos_level INTEGER;
+             ALTER TABLE containers ADD COLUMN pos_slot INTEGER;
+             CREATE UNIQUE INDEX idx_containers_position
+                 ON containers(parent_id, pos_level, pos_slot)
+                 WHERE pos_level IS NOT NULL AND pos_slot IS NOT NULL;",
+        )?;
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
