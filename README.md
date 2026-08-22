@@ -340,33 +340,134 @@ it runs on, use `--host 127.0.0.1` (QR scanning from a phone won't work then).
 
 ## Builds and releases
 
-Every push, on any branch, runs formatting, clippy with warnings denied, the
-unit tests, a release build, a smoke test that starts the binary and queries
-it, and the benchmarks. Benchmark medians are published to the job summary as
-a table; they do not gate the build, because runner timings are too noisy to
-fail on, but a regression is visible while the change is still in progress.
+Everything happens in one run per push: checks, benchmarks, version, build,
+release, image. There is no separate CI workflow — a green tick on a commit
+means the same run that would have released it was happy with it.
 
-**Container images** go to `ghcr.io/t342guy/packrat` from `main` and from `v*`
-tags, built for x86-64. Release archives additionally carry an arm64 binary for
-anyone running this on a Pi; the image is x86-64 only because building arm64
-images means emulation, which cost twenty-five minutes a push against three.
+On **every branch**, a push runs formatting, clippy with warnings denied, the
+unit tests, shellcheck over the release scripts and the bash embedded in the
+workflow itself, tests for the release tooling, a release build, a smoke test
+that starts the binary and queries it, the benchmarks, the packaging, and a
+container build.
 
-**Releases** are cut automatically on every merge to `main`, or on demand from
-the Actions tab where you can choose whether to raise the patch, minor or major
-part. The workflow bumps the version in `Cargo.toml`, commits it back, tags it,
-builds statically linked binaries for x86-64 and arm64 Linux, packages each as
-both `.tar.gz` and `.zip` with the README and the installer alongside, and
-publishes a GitHub release listing every commit since the previous tag, with
-SHA-256 checksums.
+What that run *publishes* depends on where it came from:
 
-Versions look like `0.1.1-2026.aug.21` — the semver part says what changed, the
-date says when it was built. The day is deliberately not zero-padded: semver
-forbids leading zeros in numeric pre-release identifiers, and cargo rejects
-`0.1.1-2026.aug.05` outright. `scripts/next-version.sh` computes it and can be
-run by hand to see what the next release would be called.
+| Trigger | Cuts | Example |
+| --- | --- | --- |
+| Push to `main` | pre-release on the `pre` channel | `0.1.4-pre1-2026.aug.22` |
+| **Manual run on `main`** | **production release** | `0.1.4-2026.aug.22` |
+| Push to `dev` | pre-release on the `dev` channel | `0.1.4-dev1-2026.aug.22` |
+| Push to a branch with an open PR | pre-release named after whoever opened it | `0.1.4-claude.1-2026.aug.22` |
+| Push to any other branch | nothing — built and checked only | |
+| A pull request from a fork | nothing — untrusted code is never tagged | |
 
-Pushing to any other branch runs the same build and packaging without bumping,
-tagging or publishing anything, so the pipeline can be exercised safely.
+Production releases are deliberately manual: cutting one is the single decision
+that needs a human to say whether it's a patch, a minor or a major. Run the
+pipeline from the Actions tab on `main`, leave **release_type** on
+`production`, and pick the **bump**. Asking for a production release from any
+other branch is refused rather than quietly downgraded — it would tag code that
+`main` has never seen.
+
+Everything else flows automatically, so `main` and `dev` always have a
+published build to point at without anyone cutting a release for it.
+
+In order, a publishing run:
+
+1. works out the version and the channel from the branch and the event;
+2. builds statically linked binaries for x86-64 and arm64 Linux, packaging each
+   as both `.tar.gz` and `.zip` with the README, the licence and the installer
+   alongside;
+3. benchmarks the build and compares it against the previous release;
+4. bumps `Cargo.toml`, commits it back, and tags it;
+5. publishes a GitHub release listing every commit since the previous tag, with
+   the benchmark verdict, SHA-256 checksums, and `benchmarks.json` attached;
+6. builds the container image from the same commit and pushes it.
+
+The bump and the tag happen in the publish job, *after* the checks and every
+build have passed, so a failing run leaves no dangling tag and burns no version
+number.
+
+Keeping the image in the same run is the point: when it was a separate
+workflow, it built whatever `Cargo.toml` said at its own ref, so an image from
+`main` carried the version from *before* the bump. Now the release archives,
+the git tag and the image all name the same version, and the build asserts that
+the binary agrees before anything is published.
+
+### Container tags
+
+| Tag | Follows |
+| --- | --- |
+| `latest` | the last **production** release, and nothing else |
+| `prerelease` | the last `pre` release from `main` |
+| `dev` | the last `dev` release |
+| `0.1.4-claude.1-2026.aug.22` | that exact build — every release gets one |
+
+Contributor channels get only their exact version, so a pull request can never
+move a tag anyone is following.
+
+The image is x86-64 only because building arm64 images means emulation, which
+cost twenty-five minutes a push against three. Release archives still carry an
+arm64 binary for anyone running this on a Pi, since those build natively and
+cost nothing.
+
+### Version numbers
+
+Versions look like `0.1.4-2026.aug.22` — the semver part says what changed, the
+date says when it was built. Pre-releases insert a channel:
+`0.1.4-pre1-2026.aug.22`, `0.1.4-dev1-2026.aug.22`,
+`0.1.4-claude.1-2026.aug.22`. A production release is the same string with the
+channel part removed.
+
+**Pre-releases never advance production numbering.** The base always comes from
+the last *production* tag, never the last tag of any kind, so `pre`, `dev` and
+every contributor channel can all be running against 0.1.4 at once and the next
+production release is still 0.1.4. Counters are per channel, so they advance
+independently and each one restarts at 1 once production ships.
+
+Two details that look inconsistent but aren't:
+
+- **Days are not zero-padded, and channels are lowercased.** Semver forbids
+  leading zeros in numeric pre-release identifiers, and cargo rejects
+  `0.1.1-2026.aug.05` outright.
+- **`pre` and `dev` join straight onto their counter; a username takes a dot.**
+  Neither fixed channel can end in a digit, but a username can — `user1` with
+  counter 1 would read `user11`, which can't be parsed back. The dot is the
+  only thing separating them.
+
+Logins are sanitised into valid identifiers on the way in, so
+`dependabot[bot]` becomes the `dependabot-bot` channel.
+
+One wrinkle worth knowing: under strict semver ordering
+`0.1.4-pre1-2026.aug.22` sorts *above* `0.1.4-2026.aug.22`, because numeric
+pre-release identifiers rank below alphanumeric ones and `2026` is numeric
+where `pre1-2026` is not. Both are valid semver and cargo accepts both. It
+does not matter here — nothing resolves Packrat by version range, and marking
+the release as a pre-release on GitHub is what actually keeps previews out of
+the way — but a tool that sorts these strings will disagree with the pipeline
+about which came first.
+
+`scripts/next-version.sh` computes any of these and can be run by hand;
+`scripts/release-plan.sh` holds the branch rules. Both are tested by
+`scripts/test-next-version.sh`, including the case that matters most: given a
+history of `v0.1.3` plus pre-releases on three channels, a production patch
+bump still yields `0.1.4`.
+
+### Benchmarks in the release
+
+The bench job writes `benchmarks.json` — one median and one absolute deviation
+per case — and attaches it to the release. The next release downloads the most
+recent one it can find and compares against it, so the release notes and the
+job summary both open with a verdict:
+
+> 🟢 **BETTER** against `0.1.3-2026.aug.21` — 3 cases got faster and nothing
+> regressed. Overall -12.4% across 24 shared cases.
+
+A case only counts as moved when it clears both a flat 5% floor and the two
+runs' own measured spread; everything else is reported as noise rather than
+dressed up as a win. The overall figure is the geometric mean of the ratios,
+which is the honest way to average a set of speedups. Benchmarks never gate a
+release — shared runners are far too noisy for that — but a regression is now
+impossible to miss.
 
 ## Development
 
@@ -397,7 +498,7 @@ src/barcode.rs  Code 128 encoding
 src/backup.rs   export and import
 static/         frontend, embedded into the binary at compile time
 Dockerfile      two-stage build; the runtime image is Alpine plus the binary
-scripts/        install.sh — installs the binary and registers it to autostart
+scripts/        install.sh and the release tooling, all of it tested
 ```
 
 ## License
