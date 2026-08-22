@@ -123,6 +123,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/containers/{id}", delete(api::delete_container))
         .route("/api/containers/{id}/qr.svg", get(media::container_qr))
         .route("/api/containers/{id}/verify", post(api::verify_container))
+        .route("/api/containers/{id}/grid", put(api::set_container_grid))
+        .route(
+            "/api/containers/{id}/position",
+            put(api::set_container_position),
+        )
         .route(
             "/api/containers/{id}/barcode.svg",
             get(media::container_barcode),

@@ -484,3 +484,131 @@ details.childbox > .list { border-top: 1px solid var(--border); }
   display: block; width: 100%; height: 60vh; min-height: 260px; border: 0;
   background: #fff;
 }
+/* --------------------------------------------------------------- layout map
+   A shelf drawn as it stands: levels down, slots across. The perspective is
+   cosmetic — the model underneath is a flat grid, because that is all anyone
+   wants to type in. Depth is never asked for and never drawn to scale. */
+
+.shelf-wrap { perspective: 1100px; perspective-origin: 50% 30%; margin-bottom: 16px; }
+
+.shelf {
+  transform: rotateX(7deg);
+  transform-style: preserve-3d;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 12px 18px;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.shelf-level { display: flex; align-items: stretch; gap: 8px; }
+
+.shelf-level .level-tag {
+  flex: 0 0 34px;
+  display: flex; align-items: center; justify-content: center;
+  font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  border-right: 1px dashed var(--border);
+}
+
+.shelf-cells {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(var(--slots), minmax(0, 1fr));
+  gap: 6px;
+  padding-bottom: 8px;
+  /* The board each level sits on. */
+  border-bottom: 3px solid var(--border);
+  border-radius: 0 0 3px 3px;
+}
+
+.cell {
+  min-height: 62px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  padding: 6px;
+  display: flex; flex-direction: column; justify-content: center; gap: 2px;
+  text-align: center;
+  overflow: hidden;
+  transition: transform .15s ease, box-shadow .15s ease, opacity .3s ease;
+}
+
+.cell.empty {
+  background: repeating-linear-gradient(
+    135deg, transparent, transparent 5px, var(--surface-2) 5px, var(--surface-2) 10px);
+  color: var(--muted);
+  font: 500 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-style: dashed;
+  cursor: pointer;
+}
+.cell.empty:hover { border-color: var(--accent); color: var(--accent); }
+
+.cell.filled {
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  text-decoration: none;
+  color: inherit;
+}
+.cell.filled:hover { transform: translateY(-2px); }
+
+.cell .cell-code {
+  font: 700 11px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  letter-spacing: .02em;
+}
+.cell .cell-name {
+  font-size: 12px; line-height: 1.2;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.cell .cell-count { font-size: 10px; color: var(--muted); }
+.cell.is-stale .cell-code::after { content: ' ⚠'; }
+
+/* The thing you came for: open a box and its slot lights up on the shelf. */
+.cell.located {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), var(--shadow);
+  animation: locate-pulse 1.1s ease-out 3;
+}
+.shelf.locating .cell:not(.located) { opacity: .45; }
+
+@keyframes locate-pulse {
+  0%   { box-shadow: 0 0 0 2px var(--accent), 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  70%  { box-shadow: 0 0 0 2px var(--accent), 0 0 0 14px transparent; }
+  100% { box-shadow: 0 0 0 2px var(--accent), 0 0 0 0 transparent; }
+}
+
+/* Motion is decoration here; the border and the dimming already say which
+   cell it is, so a reduced-motion reader loses nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .shelf { transform: none; }
+  .cell.located { animation: none; }
+  .cell, .cell.filled:hover { transition: none; transform: none; }
+}
+
+.shelf-legend {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  margin: -6px 0 14px; font-size: 12px; color: var(--muted);
+}
+.shelf-legend .coord {
+  font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+}
+
+.unplaced-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.unplaced-strip .chip {
+  border: 1px dashed var(--border); border-radius: 999px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer; background: var(--surface);
+}
+.unplaced-strip .chip:hover { border-color: var(--accent); color: var(--accent); }
+
+@media (max-width: 560px) {
+  .shelf-wrap { perspective: none; }
+  .shelf { transform: none; }
+  .cell { min-height: 54px; }
+  .cell .cell-name { -webkit-line-clamp: 1; }
+}
