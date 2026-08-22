@@ -10,6 +10,11 @@ without opening it.** Every box gets a printed label with a QR code and a
 barcode — scan it with a phone or a barcode scanner and its contents open on
 screen.
 
+> [!WARNING]
+> Hey there! This is a work in progress project, and SHOULD BE USED WITH CARE!\
+> I can guarantee that there are a lot of bugs that have not been found yet, and a lot of missing features that are missing.\
+> Please DO make issues, pull requests, or whatever you want to do to help this project! 
+
 ## Quick start
 
 Three ways in, in increasing order of permanence.
